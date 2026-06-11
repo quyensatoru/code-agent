@@ -1,0 +1,29 @@
+{
+  "name": "openrouter-code-agent",
+  "version": "0.1.0",
+  "description": "Claude Agent SDK-shaped query() coding agent over OpenRouter models.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./query": "./src/query.js"
+  },
+  "bin": {
+    "oragent": "./bin/oragent.js"
+  },
+  "scripts": {
+    "start": "node ./bin/oragent.js",
+    "serve": "node ./bin/oragent.js serve",
+    "check": "node --check bin/oragent.js && for f in src/*.js; do node --check \"$f\" || exit 1; done",
+    "format": "npx prettier --write \"src/**/*.{js,ts,tsx,json}\" --tab-width 4 --print-width 100 --single-quote true --semi true --trailing-comma es5 --arrow-parens always --bracket-spacing true --end-of-line lf",
+    "smoke": "node ./bin/oragent.js --help && node ./bin/oragent.js tools"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "ignore": "^7.0.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
