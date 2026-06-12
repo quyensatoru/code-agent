@@ -1,17 +1,32 @@
-// Minimal hook runner mirroring the SDK's hook contract (practical subset).
+// Hook runner mirroring the SDK's hook contract (practical subset).
 //
 // options.hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>>
 //   HookCallbackMatcher = { matcher?: string; hooks: HookCallback[] }
 //   HookCallback = (input, toolUseID, { signal }) => Promise<HookJSONOutput>
 //
-// Supported events: PreToolUse, PostToolUse, UserPromptSubmit, Stop.
+// Hook callbacks receive an SDK-shaped payload:
+//   PreToolUse       { hook_event_name, tool_name, tool_input }
+//   PostToolUse      { hook_event_name, tool_name, tool_input, tool_response }
+//   UserPromptSubmit { hook_event_name, prompt }
+//   Stop / SessionStart / SessionEnd { hook_event_name }
+//
 // A PreToolUse hook may block the call or rewrite tool input via
-// hookSpecificOutput.{permissionDecision, updatedInput}.
+// hookSpecificOutput.{permissionDecision, updatedInput}. A Stop hook returning
+// decision:"block" keeps the agent working (the reason is fed back as context).
 
-export const HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'Stop'];
+export const HOOK_EVENTS = [
+    'PreToolUse',
+    'PostToolUse',
+    'UserPromptSubmit',
+    'Stop',
+    'SessionStart',
+    'SessionEnd',
+];
 
-export async function runHooks(event, hooks, { toolName, input, signal, toolUseID } = {}) {
-    const matchers = hooks?.[event];
+const TOOL_SCOPED_EVENTS = new Set(['PreToolUse', 'PostToolUse']);
+
+export async function runHooks(event, hooks, context = {}) {
+    const { toolName, input, toolResponse, prompt, signal, toolUseID } = context;
     const aggregate = {
         blocked: false,
         continue: true,
@@ -21,12 +36,15 @@ export async function runHooks(event, hooks, { toolName, input, signal, toolUseI
         permissionDecision: undefined,
         systemMessages: [],
     };
+    const matchers = hooks?.[event];
     if (!Array.isArray(matchers) || matchers.length === 0) return aggregate;
+
+    const payload = buildPayload(event, { toolName, input, toolResponse, prompt });
 
     for (const matcher of matchers) {
         if (!matcherMatches(matcher.matcher, toolName, event)) continue;
         for (const hook of matcher.hooks || []) {
-            const output = await hook(input ?? {}, toolUseID, { signal });
+            const output = await hook(payload, toolUseID, { signal });
             applyOutput(aggregate, output);
             if (aggregate.blocked) return aggregate;
         }
@@ -34,9 +52,25 @@ export async function runHooks(event, hooks, { toolName, input, signal, toolUseI
     return aggregate;
 }
 
+function buildPayload(event, { toolName, input, toolResponse, prompt }) {
+    if (event === 'PreToolUse') {
+        return { hook_event_name: event, tool_name: toolName, tool_input: input ?? {} };
+    }
+    if (event === 'PostToolUse') {
+        return {
+            hook_event_name: event,
+            tool_name: toolName,
+            tool_input: input ?? {},
+            tool_response: toolResponse,
+        };
+    }
+    if (event === 'UserPromptSubmit') return { hook_event_name: event, prompt: prompt ?? '' };
+    return { hook_event_name: event };
+}
+
 function matcherMatches(matcher, toolName, event) {
-    // UserPromptSubmit / Stop are not tool-scoped — always run.
-    if (event === 'UserPromptSubmit' || event === 'Stop') return true;
+    // Only PreToolUse/PostToolUse are tool-scoped — other events always run.
+    if (!TOOL_SCOPED_EVENTS.has(event)) return true;
     if (!matcher || matcher === '*') return true;
     if (!toolName) return false;
     try {

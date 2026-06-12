@@ -1,7 +1,8 @@
 import express from 'express';
-import { query } from './query.js';
-import { OpenRouterClient } from './openrouter.js';
-import { toolDefinitions } from './tools.js';
+import { query } from '../core/query.js';
+import { OpenRouterClient } from '../providers/openrouter.js';
+import { toolDefinitions } from '../tools/index.js';
+import { listSessions } from '../sessions/index.js';
 
 export function createServer(defaults = {}) {
     const app = express();
@@ -13,6 +14,15 @@ export function createServer(defaults = {}) {
 
     app.get('/v1/tools', (_req, res) => {
         res.json({ tools: toolDefinitions });
+    });
+
+    app.get('/v1/sessions', async (req, res, next) => {
+        try {
+            const sessions = await listSessions(req.query.cwd || defaults.cwd || process.cwd());
+            res.json({ sessions });
+        } catch (error) {
+            next(error);
+        }
     });
 
     app.get('/v1/models', async (_req, res, next) => {
@@ -53,7 +63,10 @@ export function createServer(defaults = {}) {
                 messages.push(message);
                 if (message.type === 'result') {
                     sessionId = message.session_id;
-                    result = message.subtype === 'success' ? message.result : (message.errors || []).join('\n');
+                    result =
+                        message.subtype === 'success'
+                            ? message.result
+                            : (message.errors || []).join('\n');
                 } else if (message.type === 'system') {
                     sessionId = message.session_id;
                 }

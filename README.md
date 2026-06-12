@@ -1,28 +1,72 @@
 # OpenRouter Code Agent
 
-Một clone theo **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`) — cùng contract
+Một **agent harness** theo hình mẫu **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`) — cùng contract
 `query({ prompt, options })` trả về **async generator của `SDKMessage`** — nhưng engine là
 **OpenRouter Chat Completions** thay vì binary Claude Code proprietary.
 
-Điểm đã kiểm chứng từ source/docs public:
+Repo này **không** copy binary/source proprietary. Nó clone **practical core** của public API surface
+(query loop, message taxonomy, Options, tool names, permission modes, hooks, reasoning) và bổ sung
+các thành phần harness thực thụ: **memory, context compaction, permission rules, subagent, custom tools**.
 
-- SDK thật export `query({ prompt, options })` (async generator) và bundle native Claude Code binary; `model` được truyền cho binary, package **không** expose provider adapter.
-- Built-in tools của SDK: `Bash, Read, Write, Edit, Glob, Grep, TodoWrite, WebFetch, WebSearch, Task, NotebookEdit…`; permission modes `default | acceptEdits | bypassPermissions | plan`; hooks `PreToolUse/PostToolUse/…`; `canUseTool`.
-- Repo này **không** copy binary/source proprietary. Nó clone **practical core** của public API surface (query loop, message taxonomy, Options, tool names, permission modes, hooks, reasoning) trên nền OpenRouter.
+## Cấu trúc repo (harness pattern)
 
-## Clone 1:1 (practical core)
+```
+bin/oragent.js          CLI (run / chat / serve / models / tools / sessions)
+scripts/check.js        Syntax check toàn bộ source (cross-platform)
+tests/                  Unit tests (node --test)
+src/
+  index.js              Public surface (query, tool, createSdkMcpServer, …)
+  legacy.js             runAgent() back-compat shim
+  core/                 Vòng lặp agent
+    query.js              query(): turn loop, gating, compaction, persist
+    options.js            Normalize SDK Options + SYSTEM_PROMPT
+    system-prompt.js      Lắp system prompt: env info + project doc + memory
+    messages.js           SDK message taxonomy builders/translators
+  providers/
+    openrouter.js         OpenRouter client: key rotation, SSE streaming, retry
+  tools/                 Tool registry + implementations
+    index.js              Registry, runtime dispatch, validation, MCP routing
+    meta.js               TOOL_META (permission class per tool)
+    validate.js           JSON-schema validation + coercion cho tool args
+    search.js             Glob/Grep/list_files/print_tree (.gitignore-aware)
+    fs.js                 Read/Write/Edit
+    shell.js              Bash
+    web.js                WebFetch/WebSearch (Tavily/DuckDuckGo)
+    todo.js               TodoWrite/TodoRead
+    agent.js              Agent — subagent (Task) tool
+    shared.js             Truncation + helpers chung
+  permissions/
+    index.js              evaluate(): deny/allow rules + mode + canUseTool
+    rules.js              `Tool(spec)` rules, safe read-only Bash detection
+  hooks/index.js         PreToolUse/PostToolUse/UserPromptSubmit/Stop/Session*
+  context/
+    attachments.js        Image/PDF/doc/audio/video -> content parts
+    perception.js         Stage-1 omni model (media -> text)
+    compaction.js         Token estimate, trim tool output cũ, auto-compact
+  memory/index.js        Persistent memory (.oragent/memory/MEMORY.md)
+  sessions/index.js      Session persist/resume (.oragent/sessions)
+  server/index.js        Express API
+  utils/env.js           .env loader
+```
 
-| SDK | Ở đây |
+## Các thành phần harness
+
+| Thành phần | Cơ chế |
 |---|---|
-| `query({prompt, options})` → `AsyncGenerator<SDKMessage>` | ✅ `src/query.js` |
-| Messages: `system`(init) → `assistant` → `user`(tool_result) → `result`(success/error_*) + `partial_assistant` | ✅ `src/messages.js` |
-| Tool names `Read/Write/Edit/Bash/Glob/Grep/TodoWrite/WebFetch/WebSearch` | ✅ `src/tools.js` |
-| `permissionMode`, `canUseTool`, `PermissionResult` | ✅ `src/permissions.js` |
-| `hooks` (PreToolUse/PostToolUse/UserPromptSubmit/Stop) | ✅ `src/hooks.js` |
-| Reasoning: `maxThinkingTokens` / `effort` / `thinking` → OpenRouter `reasoning` | ✅ `src/options.js` |
-| Sessions (`resume`, persist) | ✅ `src/session.js` |
+| **Agent loop** | `query()` → system init → assistant → tool_result → … → result |
+| **Tool calling** | Schema validation + coercion trước khi chạy; lỗi trả về dạng model tự sửa được; Edit bắt buộc search text unique (hoặc `replace_all`) |
+| **Permissions** | 4 mode (`default/plan/acceptEdits/bypassPermissions`) + rules `Tool(spec)`: `allowedTools:["Bash(npm *)"]` auto-allow, `disallowedTools:["Bash(rm *)"]` luôn deny; Bash read-only (git status/log/diff, ls, cat…) không cần hỏi |
+| **Hooks** | `PreToolUse` (block/rewrite input), `PostToolUse` (nhận `tool_response`), `UserPromptSubmit`, `Stop` (block = bắt agent làm tiếp), `SessionStart/End` |
+| **Memory** | `.oragent/memory/MEMORY.md` index nạp vào system prompt mỗi session; agent tự Write/Edit memory files |
+| **Project context** | Tự nạp `ORAGENT.md` / `AGENTS.md` / `CLAUDE.md` + env info (cwd, OS, date, git branch/dirty) vào system prompt |
+| **Context compaction** | Ước lượng token (~4 chars/token); >60% budget → trim tool output cũ; >80% → model tự tóm tắt history thành 1 system message, emit `system/compact_boundary` |
+| **Subagent** | Tool `Agent`: chạy `query()` lồng, plan-mode (read-only), context riêng, trả về câu trả lời cuối — giữ context cha sạch |
+| **Custom tools** | `tool()` + `createSdkMcpServer()` + `options.mcpServers` → execution được route thật, tên `mcp__<server>__<tool>` |
+| **Sessions** | Persist + `resume` qua `.oragent/sessions/<id>.json` |
+| **Multimodal** | Perception 2-stage: omni model đọc media → text cho planner |
 
-**Out of scope** (nêu rõ để khỏi nhầm với SDK đầy đủ): Query control methods (`interrupt`/`setModel`/…), plugins, real MCP transport, full 30+ message taxonomy, `settingSources`. Có sẵn factory `tool()` / `createSdkMcpServer()` cho parity về shape nhưng chưa route execution.
+**Out of scope** (so với SDK đầy đủ): Query control methods (`interrupt`/`setModel`/…), plugins,
+external MCP transport (stdio/SSE), full 30+ message taxonomy, `settingSources`, slash commands.
 
 ## Cài đặt
 
@@ -42,32 +86,49 @@ OPENROUTER_TIMEOUT_MS=600000
 ## Library API — `query()`
 
 ```js
-import { query } from "openrouter-code-agent";
+import { query, tool, createSdkMcpServer } from "openrouter-code-agent";
 
 for await (const message of query({
   prompt: "list the files and summarize the structure",
   options: {
     model: "anthropic/claude-sonnet-4.5",
     permissionMode: "plan",          // default | acceptEdits | bypassPermissions | plan
-    allowedTools: ["Read", "Glob", "Grep"],
+    allowedTools: ["Read", "Glob", "Grep", "Bash(npm test*)"], // Tool(spec) = auto-allow rule
+    disallowedTools: ["Bash(rm *)"],                            // luôn deny
     effort: "high",                  // -> OpenRouter reasoning.effort
     includePartialMessages: true,    // stream partial_assistant deltas
+    maxContextTokens: 100000,        // auto-compact ở ~80%
     canUseTool: async (name, input) => ({ behavior: "allow" }),
     hooks: {
-      PreToolUse: [{ matcher: "Bash", hooks: [async (input) => ({ /* block/allow/modify */ }) ] }],
+      PostToolUse: [{ matcher: "Write|Edit", hooks: [async (p) => {
+        // p = { hook_event_name, tool_name, tool_input, tool_response }
+        return {};
+      }] }],
+      Stop: [{ hooks: [async () => ({ decision: "block", reason: "run tests first" })] }],
+    },
+    mcpServers: {
+      calc: createSdkMcpServer({
+        name: "calc",
+        tools: [tool("add", "Add numbers", {
+          type: "object", required: ["a","b"],
+          properties: { a: { type: "number" }, b: { type: "number" } },
+        }, async ({ a, b }) => ({ content: [{ type: "text", text: String(a + b) }] }))],
+      }),
     },
   },
 })) {
   if (message.type === "assistant") { /* message.message.content blocks */ }
+  if (message.type === "system" && message.subtype === "compact_boundary") { /* context đã được nén */ }
   if (message.type === "result") console.log(message.result);
 }
 ```
 
 `prompt` nhận `string` hoặc `AsyncIterable<SDKUserMessage>`. Mỗi `query()` yield lần lượt:
 `{type:"system",subtype:"init"}` → `{type:"assistant"}` → `{type:"user"}` (tool_result) →
-`{type:"result"}` (`success` | `error_max_turns` | `error_during_execution`).
+(`{type:"system",subtype:"compact_boundary"}` khi nén context) → `{type:"result"}`
+(`success` | `error_max_turns` | `error_during_execution`).
 
-## CLI (deployment đầu tiên)
+## CLI
 
 ```sh
 npm start -- "liệt kê file trong project và giải thích cấu trúc" --permission-mode plan
@@ -80,19 +141,28 @@ npm start -- tools
 npm start -- sessions
 ```
 
-Link global:
-
-```sh
-npm link
-oragent "review code trong src" --permission-mode plan
-```
+Link global: `npm link` rồi `oragent "review code trong src" --permission-mode plan`.
 
 Permission modes (SDK names; alias cũ vẫn nhận):
 
-- `default`: read chạy thẳng; edit/bash hỏi qua `canUseTool` (TTY); ngoài TTY thì deny.
-- `plan` (alias `read-only`): chỉ tool read-only (Read/Glob/Grep/Web*); deny mọi edit/bash.
+- `default`: read + Bash read-only chạy thẳng; edit/bash khác hỏi qua `canUseTool` (TTY: trả lời `y`/`a` = always/`N`); ngoài TTY thì deny.
+- `plan` (alias `read-only`): chỉ tool read-only (Read/Glob/Grep/Web*/Agent) + Bash read-only; deny mọi edit.
 - `acceptEdits` (alias `accept-edits`): tự cho phép Write/Edit; Bash vẫn hỏi.
-- `bypassPermissions` (alias `bypass`): cho phép tất cả; bắt buộc `--allow-dangerously-skip-permissions`.
+- `bypassPermissions` (alias `bypass`): cho phép tất cả; bắt buộc `--allow-dangerously-skip-permissions`. `disallowedTools` rules vẫn được tôn trọng.
+
+Flags harness mới:
+
+```
+--max-context-tokens <n>   Budget context trước khi auto-compact (default 100000)
+--no-auto-compact          Tắt auto-compaction
+--no-project-context       Không nạp ORAGENT.md / AGENTS.md / CLAUDE.md
+--no-memory                Không nạp memory index
+```
+
+## Memory & project context
+
+- Đặt hướng dẫn dự án trong `ORAGENT.md` / `AGENTS.md` / `CLAUDE.md` ở root — tự nạp vào system prompt.
+- Agent có memory bền vững tại `.oragent/memory/`: mỗi memory là một file markdown nhỏ, `MEMORY.md` là index được nạp mỗi session. Agent tự cập nhật bằng Write/Edit (cần permission edit như thường lệ).
 
 ## Express API
 
@@ -101,27 +171,26 @@ npm run serve -- --port 3333
 
 curl -s http://127.0.0.1:3333/health
 curl -s http://127.0.0.1:3333/v1/tools
+curl -s http://127.0.0.1:3333/v1/sessions
 curl -s -X POST http://127.0.0.1:3333/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"List files","permissionMode":"plan"}'
 ```
 
-`/v1/query` chạy `query()` và trả `{ result, sessionId, messages }` (mảng SDKMessage). Server
-mặc định `plan` (read-only) vì không có TTY để xác nhận permission.
+`/v1/query` chạy `query()` và trả `{ result, sessionId, messages }`. Server mặc định `plan`
+(read-only) vì không có TTY để xác nhận permission.
 
 ## Built-in tools (SDK names)
 
-`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `TodoWrite`, `WebFetch`, `WebSearch`
+`Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `TodoWrite`, `WebFetch`, `WebSearch`, `Agent`
 (+ extras không thuộc SDK: `list_files`, `print_tree`, `TodoRead`).
 
-- `Glob`/`Grep`/`list_files` tôn trọng `.gitignore` ở root và thư mục con; chỉ `.git/` luôn bị bỏ qua.
+- Mọi tool args được validate + coerce theo JSON schema trước khi chạy; sai schema trả về `INVALID INPUT …` để model tự sửa.
+- `Glob`/`Grep`/`list_files` tôn trọng `.gitignore` ở root và thư mục con; chỉ `.git/` luôn bị bỏ qua. `Grep` hỗ trợ `case_sensitive` + `context` lines.
 - `WebSearch` local dùng `TAVILY_API_KEY` nếu có, nếu không fallback DuckDuckGo HTML best-effort.
-- Ngoài ra OpenRouter server tools `openrouter:web_search` / `openrouter:web_fetch` bật mặc định; tắt bằng `--no-web-search --no-web-fetch`.
+- OpenRouter server tools `openrouter:web_search` / `openrouter:web_fetch` bật mặc định; tắt bằng `--no-web-search --no-web-fetch`.
 
 ## Context ngoài text — pipeline 2 model (perception → planner)
-
-Input chỉ-text làm context nghèo → đôi khi agent sửa nhầm. Thêm context bên ngoài
-(ảnh, tài liệu, audio, video) qua **2 bước**:
 
 ```
 Screenshot / Document / Audio / Video
@@ -134,70 +203,40 @@ nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
    OPENROUTER_MODEL (vd nvidia/nemotron-3-super-120b-a12b:free)
 ```
 
-Model perception nhận đa phương thức (image/audio/video/text) và **trả về text**, nên
-planner **không cần** là model vision — nó chỉ reasoning trên text đã trích xuất. Cả hai
-stage dùng chung client nên **xoay tua key** vẫn áp dụng.
-
 ```sh
 oragent "lỗi UI trong ảnh này là gì? đề xuất fix" --image ./bug.png
 oragent "đối chiếu code với spec" --doc ./spec.md --doc ./api-notes.txt
 oragent "tóm tắt & trích dẫn paper" --pdf https://arxiv.org/pdf/1706.03762 --pdf-engine cloudflare-ai
 oragent "ghi chú voice này muốn gì?" --audio ./note.mp3
 oragent "bug lặp lại trong clip này" --video ./repro.mp4
-oragent "review theo screenshot + tài liệu" --image ./design.png --doc ./requirements.md --permission-mode plan
 ```
 
-- `--image <path|url>` → ảnh (PNG/JPEG/WebP/GIF).
-- `--doc <path|url>` → `.pdf` parse bằng plugin `file-parser`; doc text (`.md/.txt/.json/...`) **inline** kèm nhãn; local quá lớn bị cắt (200k chars).
-- `--pdf <path|url>` → ép PDF; `--pdf-engine native|cloudflare-ai|mistral-ocr`.
-- `--audio <path>` → audio **local** (base64; OpenRouter không nhận URL audio). wav/mp3/flac/m4a/ogg/aac.
-- `--video <path|url>` → video (mp4/webm/mov…); URL tuỳ provider.
-- `--vision-model <slug>` (hoặc `OPENROUTER_VISION_MODEL`) → đổi model perception.
-- `--no-perception` → **bỏ** stage 1, đính raw media thẳng vào main model (cần main model multimodal).
-- Flags lặp lại được; chạy chỉ-attachment không cần prompt text.
+- `--image/--doc/--pdf/--audio/--video <path|url>` (repeatable); `--pdf-engine native|cloudflare-ai|mistral-ocr`.
+- `--vision-model <slug>` (hoặc `OPENROUTER_VISION_MODEL`) đổi model perception; `--no-perception` đính raw media thẳng vào main model.
 
-Library API:
-
-```js
-await query({ prompt: "what's wrong here?", options: {
-  model: "nvidia/nemotron-3-super-120b-a12b:free",        // planner (text)
-  perceptionModel: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", // omni
-  // perception: false,                                    // -> attach raw media to model
-  attachments: [
-    { kind: "image", ref: "./bug.png" },
-    { kind: "audio", ref: "./note.mp3" },
-    { kind: "doc",   ref: "./spec.md" },
-    { kind: "pdf",   ref: "https://arxiv.org/pdf/1706.03762" },
-  ],
-  pdfEngine: "cloudflare-ai",
-}});
-```
-
-Engine dịch sang shape OpenAI-compatible mà OpenRouter nhận: `image_url`, `file` (+plugin
-`file-parser`), `input_audio`, `video_url`.
+Library API: `options.attachments = [{ kind: 'image'|'pdf'|'doc'|'audio'|'video', ref }]`, `options.perceptionModel`, `options.perception:false`.
 
 ## Reasoning
 
-`--effort` (hoặc `--reasoning-effort`) và `--max-thinking-tokens` map sang OpenRouter
-`reasoning.effort` / `reasoning.max_tokens`. `thinking:{type:"disabled"}` → `reasoning.exclude`.
+`--effort` và `--max-thinking-tokens` map sang OpenRouter `reasoning.effort` / `reasoning.max_tokens`.
+`thinking:{type:"disabled"}` → `reasoning.exclude`.
 
 ```sh
 oragent "phân tích lỗi concurrency này" --effort high --max-tokens 12000
 ```
 
-`.env`:
+## Dev
 
 ```sh
-OPENROUTER_REASONING_EFFORT=medium
-OPENROUTER_REASONING_MAX_TOKENS=4096
+npm run check    # node --check toàn bộ source
+npm test         # unit tests (permissions, validation, tools, hooks, compaction)
+npm run smoke    # CLI help + tools
 ```
-
-Lưu ý: reasoning chỉ có tác dụng nếu model/provider trên OpenRouter hỗ trợ; không phải model
-nào cũng tool-call tốt — chọn model hỗ trợ function/tool calling cho coding agent.
 
 ## Troubleshooting
 
 ```sh
 oragent "task chậm" --timeout-ms 900000        # model free/chậm
 oragent "task offline" --no-web-search --no-web-fetch
+oragent "context quá dài bị lỗi" --max-context-tokens 30000   # ép compact sớm cho model context nhỏ
 ```

@@ -3,12 +3,12 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { fileURLToPath } from "node:url";
-import { query } from "../src/query.js";
-import { loadDotEnv } from "../src/env.js";
-import { OpenRouterClient } from "../src/openrouter.js";
-import { listSessions } from "../src/session.js";
-import { startServer } from "../src/server.js";
-import { toolDefinitions, TOOL_META } from "../src/tools.js";
+import { query } from "../src/core/query.js";
+import { loadDotEnv } from "../src/utils/env.js";
+import { OpenRouterClient } from "../src/providers/openrouter.js";
+import { listSessions } from "../src/sessions/index.js";
+import { startServer } from "../src/server/index.js";
+import { toolDefinitions, TOOL_META } from "../src/tools/index.js";
 
 // Flags that may be passed multiple times accumulate into an array.
 const REPEATABLE = new Set(["image", "doc", "file", "pdf", "audio", "video"]);
@@ -193,6 +193,11 @@ function buildOptions(options, rl) {
     permissionMode,
     allowDangerouslySkipPermissions: Boolean(options.allowDangerouslySkipPermissions),
     allowOutsideCwd: Boolean(options.allowOutsideCwd),
+    // Context management + harness context sections.
+    maxContextTokens: numberOption(options.maxContextTokens || process.env.OPENROUTER_MAX_CONTEXT_TOKENS),
+    autoCompact: options.noAutoCompact ? false : undefined,
+    loadProjectContext: options.noProjectContext ? false : undefined,
+    memory: options.noMemory ? false : undefined,
     resume: options.session,
     canUseTool: createCanUseTool(rl),
     // External context attachments: images, PDFs, docs, audio, video.
@@ -215,6 +220,14 @@ function logEngineEvent(event) {
     console.error(`[perception] failed: ${event.error}`);
   } else if (event.type === "retry") {
     console.error(`[retry ${event.attempt}] ${event.reason} — retrying on ${event.model}`);
+  } else if (event.type === "compaction_start") {
+    console.error(`[compact] context ~${event.estimatedTokens} tokens — summarizing older turns…`);
+  } else if (event.type === "compaction_end") {
+    console.error(`[compact] done — context now ~${event.estimatedTokens} tokens`);
+  } else if (event.type === "compaction_error") {
+    console.error(`[compact] failed (${event.error}) — trimmed old tool output instead`);
+  } else if (event.subagent && event.type === "tool_start") {
+    console.error(`  [subagent tool] ${event.name}`);
   }
 }
 
@@ -246,16 +259,32 @@ function mapPermissionMode(mode) {
 }
 
 // Default canUseTool: prompt on a TTY, deny otherwise (matches a headless run).
+// Answering "a" (always) remembers the grant for the rest of the run — for
+// Bash the grant is scoped to the command's first word (e.g. all `npm …`).
 function createCanUseTool(existingRl) {
+  const grants = new Set();
   return async (toolName, toolInput) => {
+    const grantKey =
+      toolName === "Bash"
+        ? `Bash:${String(toolInput.command || "").trim().split(/\s+/)[0]}`
+        : toolName;
+    if (grants.has(grantKey)) return { behavior: "allow" };
     if (!process.stdin.isTTY) {
       return { behavior: "deny", message: `${toolName} denied (no TTY to confirm)` };
     }
     const rl = existingRl || readline.createInterface({ input, output });
     const summary = truncate(JSON.stringify(toolInput), 200);
-    const answer = await rl.question(`[permission] ${toolName} ${summary}\nAllow? (y/N) `);
+    const answer = (
+      await rl.question(`[permission] ${toolName} ${summary}\nAllow? (y = yes / a = always / N = no) `)
+    )
+      .trim()
+      .toLowerCase();
     if (!existingRl) rl.close();
-    return answer.trim().toLowerCase() === "y"
+    if (answer === "a") {
+      grants.add(grantKey);
+      return { behavior: "allow" };
+    }
+    return answer === "y"
       ? { behavior: "allow" }
       : { behavior: "deny", message: `${toolName} denied by user` };
   };
@@ -375,6 +404,10 @@ Options (mapped to SDK query() Options):
   --verbosity <level>                low | medium | high | xhigh | max
   --no-web-search                    Disable OpenRouter server web search
   --no-web-fetch                     Disable OpenRouter server web fetch
+  --max-context-tokens <n>           Estimated context budget before auto-compaction (default 100000)
+  --no-auto-compact                  Disable context auto-compaction
+  --no-project-context               Skip loading ORAGENT.md / AGENTS.md / CLAUDE.md
+  --no-memory                        Skip loading the persistent memory index
 
 Environment:
   OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL, OPENROUTER_TIMEOUT_MS

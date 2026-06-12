@@ -1,5 +1,5 @@
-import { query } from './query.js';
-import { SYSTEM_PROMPT } from './options.js';
+import { query } from './core/query.js';
+import { SYSTEM_PROMPT } from './core/options.js';
 
 // Back-compat re-export: callers previously imported SYSTEM_PROMPT from here.
 export { SYSTEM_PROMPT };
@@ -34,7 +34,10 @@ export async function runAgent({ prompt, onEvent = () => {}, ...rest } = {}) {
         } else if (message.type === 'result') {
             sessionId = message.session_id;
             usage = message.usage;
-            result = message.subtype === 'success' ? message.result : (message.errors || []).join('\n');
+            result =
+                message.subtype === 'success'
+                    ? message.result
+                    : (message.errors || []).join('\n');
             onEvent({ type: 'final', result, sessionId, usage });
         }
     }

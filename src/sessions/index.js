@@ -2,6 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
+// Session persistence: each query() run saves its raw chat history under
+// .oragent/sessions/<id>.json so `resume` can continue the conversation.
+
 export function newSessionId() {
     return randomUUID();
 }

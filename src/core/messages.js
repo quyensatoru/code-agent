@@ -109,6 +109,18 @@ export function userToolResult({ sessionId, results = [], parentToolUseId = null
     };
 }
 
+// Emitted when the engine auto-compacts the conversation (mirrors the SDK's
+// system/compact_boundary message).
+export function compactBoundary({ sessionId, preTokens = 0, postTokens = 0, trigger = 'auto' }) {
+    return {
+        type: 'system',
+        subtype: 'compact_boundary',
+        uuid: newUuid(),
+        session_id: sessionId,
+        compact_metadata: { trigger, pre_tokens: preTokens, post_tokens: postTokens },
+    };
+}
+
 export function partialAssistant({ sessionId, partial }) {
     return {
         type: 'partial_assistant',

@@ -1,14 +1,21 @@
-import { OpenRouterClient } from './openrouter.js';
+import { OpenRouterClient } from '../providers/openrouter.js';
 import { normalizeOptions } from './options.js';
-import { buildOpenRouterServerTools, createToolRuntime } from './tools.js';
-import { filePlugins, resolveAttachments } from './content.js';
-import { perceive } from './perception.js';
-import { evaluate } from './permissions.js';
-import { runHooks } from './hooks.js';
-import { loadSession, newSessionId, saveSession } from './session.js';
+import { buildSystemPrompt } from './system-prompt.js';
+import {
+    buildOpenRouterServerTools,
+    createToolRuntime,
+    mcpToolDefinitions,
+} from '../tools/index.js';
+import { filePlugins, resolveAttachments } from '../context/attachments.js';
+import { perceive } from '../context/perception.js';
+import { compact, estimateTokens, trimOldToolResults } from '../context/compaction.js';
+import { evaluate } from '../permissions/index.js';
+import { runHooks } from '../hooks/index.js';
+import { loadSession, newSessionId, saveSession } from '../sessions/index.js';
 import {
     accumulateUsage,
     assistantMessage,
+    compactBoundary,
     emptyUsage,
     parseToolArguments,
     partialAssistant,
@@ -23,7 +30,8 @@ import {
 // (practical core), backed by the OpenRouter chat-completions loop instead of
 // the Claude Code binary. It owns option normalization, the system-init emit,
 // the turn loop (model call -> assistant -> permission/hook-gated tool exec ->
-// tool_result), session persistence, and the terminal result message.
+// tool_result), context compaction, session persistence, and the terminal
+// result message.
 export async function* query({ prompt, options = {} } = {}) {
     if (prompt === undefined || prompt === null) throw new Error('prompt is required');
 
@@ -43,9 +51,13 @@ export async function* query({ prompt, options = {} } = {}) {
         additionalDirectories: opts.additionalDirectories,
         allowOutsideCwd: opts.allowOutsideCwd,
         onEvent: opts.onEvent,
+        mcpServers: opts.mcpServers,
+        queryOptions: opts,
     });
+    const mcpDefinitions = mcpToolDefinitions(opts.mcpServers);
     const tools = [
         ...opts.builtinTools,
+        ...mcpDefinitions,
         ...buildOpenRouterServerTools({
             openRouterWebSearch: opts.openRouterWebSearch,
             openRouterWebFetch: opts.openRouterWebFetch,
@@ -58,7 +70,9 @@ export async function* query({ prompt, options = {} } = {}) {
             webFetchMaxContentTokens: opts.webFetchMaxContentTokens,
         }),
     ];
-    const toolNames = opts.builtinTools.map((tool) => tool.function?.name).filter(Boolean);
+    const toolNames = [...opts.builtinTools, ...mcpDefinitions]
+        .map((tool) => tool.function?.name)
+        .filter(Boolean);
 
     const history = await loadSession(opts.cwd, opts.resume).catch((error) => {
         throw new Error(`Cannot load session ${opts.resume}: ${error.message}`);
@@ -69,12 +83,30 @@ export async function* query({ prompt, options = {} } = {}) {
         model: client.model,
         cwd: opts.cwd,
         tools: toolNames,
+        mcpServers: Object.keys(opts.mcpServers),
         permissionMode: opts.permissionMode,
         apiKeySource: client.apiKeys.length ? 'env' : 'none',
         extra: { api_key_count: client.apiKeys.length },
     });
 
-    const messages = [{ role: 'system', content: opts.systemPrompt }, ...history];
+    // System prompt: base + env info + project doc + memory index (only when
+    // using the default/preset prompt).
+    const systemText = opts.enrichSystemPrompt
+        ? await buildSystemPrompt({
+              base: opts.systemPromptBase,
+              cwd: opts.cwd,
+              includeEnvInfo: opts.includeEnvInfo,
+              loadProjectContext: opts.loadProjectContext,
+              memory: opts.memory,
+          })
+        : opts.systemPromptBase;
+
+    let messages = [{ role: 'system', content: systemText }, ...history];
+
+    const sessionStart = await runHooks('SessionStart', opts.hooks, { signal });
+    for (const note of sessionStart.systemMessages) {
+        messages.push({ role: 'system', content: note });
+    }
 
     // Resolve external context (images / PDFs / docs / audio / video) into
     // OpenRouter content parts.
@@ -111,7 +143,7 @@ export async function* query({ prompt, options = {} } = {}) {
     const userTurns = await collectUserTurns(prompt);
     for (let i = 0; i < userTurns.length; i += 1) {
         const text = userTurns[i];
-        const submit = await runHooks('UserPromptSubmit', opts.hooks, { input: text, signal });
+        const submit = await runHooks('UserPromptSubmit', opts.hooks, { prompt: text, signal });
         if (submit.blocked) {
             yield finalResult('error_during_execution', {
                 errors: [submit.reason || 'Blocked by UserPromptSubmit hook'],
@@ -134,6 +166,7 @@ export async function* query({ prompt, options = {} } = {}) {
     let totalCostUsd = 0;
     let numTurns = 0;
     const permissionDenials = [];
+    const compactAtTokens = Math.floor(opts.maxContextTokens * 0.8);
 
     try {
         for (let turn = 1; turn <= opts.maxTurns; turn += 1) {
@@ -144,9 +177,45 @@ export async function* query({ prompt, options = {} } = {}) {
             numTurns = turn;
             opts.onEvent({ type: 'turn', turn, maxTurns: opts.maxTurns, model: client.model });
 
+            // Context window management: summarize-and-replace when near the
+            // limit, cheap trimming of stale tool output before that.
+            if (opts.autoCompact) {
+                const estimated = estimateTokens(messages);
+                if (estimated > compactAtTokens) {
+                    opts.onEvent({ type: 'compaction_start', estimatedTokens: estimated });
+                    try {
+                        const compacted = await compact({
+                            client,
+                            model: client.model,
+                            messages,
+                            keepRecent: opts.keepRecentMessages,
+                            signal,
+                        });
+                        if (compacted) {
+                            messages = compacted.messages;
+                            const postTokens = estimateTokens(messages);
+                            opts.onEvent({ type: 'compaction_end', estimatedTokens: postTokens });
+                            yield compactBoundary({
+                                sessionId,
+                                preTokens: estimated,
+                                postTokens,
+                                trigger: 'auto',
+                            });
+                        }
+                    } catch (error) {
+                        opts.onEvent({ type: 'compaction_error', error: error.message });
+                        messages = trimOldToolResults(messages, {
+                            keepTail: opts.keepRecentMessages,
+                        });
+                    }
+                } else if (estimated > compactAtTokens * 0.6) {
+                    messages = trimOldToolResults(messages, { keepTail: opts.keepRecentMessages });
+                }
+            }
+
             const response = yield* runModel(turn);
-            usage = accumulateUsage(usage, response.usage) || usage;
-            totalCostUsd += Number(response.usage?.cost || 0);
+            usage = accumulateUsage(usage, response?.usage) || usage;
+            totalCostUsd += Number(response?.usage?.cost || 0);
 
             const choice = response?.choices?.[0];
             const assistant = choice?.message;
@@ -173,7 +242,20 @@ export async function* query({ prompt, options = {} } = {}) {
             });
 
             if (!toolCalls.length) {
+                // Stop hooks may keep the agent working (decision: "block").
+                const stop = await runHooks('Stop', opts.hooks, { signal });
+                for (const note of stop.systemMessages) {
+                    messages.push({ role: 'system', content: note });
+                }
+                if (stop.blocked && stop.continue !== false) {
+                    messages.push({
+                        role: 'system',
+                        content: `Stop hook: ${stop.reason || 'continue working — the task is not finished yet'}`,
+                    });
+                    continue;
+                }
                 await persist();
+                await runHooks('SessionEnd', opts.hooks, { signal });
                 yield finalResult('success', { result: assistant.content || '' });
                 return;
             }
@@ -193,6 +275,7 @@ export async function* query({ prompt, options = {} } = {}) {
         }
 
         await persist();
+        await runHooks('SessionEnd', opts.hooks, { signal });
         yield finalResult('error_max_turns', {
             errors: [`Stopped after maxTurns=${opts.maxTurns}.`],
         });
@@ -272,7 +355,11 @@ export async function* query({ prompt, options = {} } = {}) {
             toolUseID: call.id,
         });
         if (pre.blocked) {
-            return { tool_use_id: call.id, content: `BLOCKED: ${pre.reason || 'PreToolUse hook'}`, is_error: true };
+            return {
+                tool_use_id: call.id,
+                content: `BLOCKED: ${pre.reason || 'PreToolUse hook'}`,
+                is_error: true,
+            };
         }
         if (pre.updatedInput) input = pre.updatedInput;
 
@@ -283,12 +370,22 @@ export async function* query({ prompt, options = {} } = {}) {
                 input,
                 canUseTool: opts.canUseTool,
                 allowDangerouslySkip: opts.allowDangerouslySkipPermissions,
+                allowRules: opts.allowRules,
+                denyRules: opts.denyRules,
                 signal,
                 toolUseID: call.id,
             });
             if (decision.behavior === 'deny') {
-                permissionDenials.push({ tool_name: name, tool_use_id: call.id, tool_input: input });
-                return { tool_use_id: call.id, content: `DENIED: ${decision.message}`, is_error: true };
+                permissionDenials.push({
+                    tool_name: name,
+                    tool_use_id: call.id,
+                    tool_input: input,
+                });
+                return {
+                    tool_use_id: call.id,
+                    content: `DENIED: ${decision.message}`,
+                    is_error: true,
+                };
             }
             if (decision.updatedInput) input = decision.updatedInput;
         }
@@ -298,6 +395,7 @@ export async function* query({ prompt, options = {} } = {}) {
         const post = await runHooks('PostToolUse', opts.hooks, {
             toolName: name,
             input,
+            toolResponse: { content, is_error },
             signal,
             toolUseID: call.id,
         });
@@ -366,10 +464,14 @@ function sleep(ms, signal) {
     return new Promise((resolve) => {
         if (signal?.aborted) return resolve();
         const timer = setTimeout(resolve, ms);
-        signal?.addEventListener('abort', () => {
-            clearTimeout(timer);
-            resolve();
-        }, { once: true });
+        signal?.addEventListener(
+            'abort',
+            () => {
+                clearTimeout(timer);
+                resolve();
+            },
+            { once: true }
+        );
     });
 }
 

@@ -1,20 +1,25 @@
-import { toolDefinitions } from './tools.js';
+import { toolDefinitions } from '../tools/index.js';
+import { parseRules } from '../permissions/rules.js';
 
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const DEFAULT_TIMEOUT_MS = 600000;
+const DEFAULT_MAX_CONTEXT_TOKENS = 100000;
 
 // The default system prompt, reused as the `claude_code` preset body. The real
-// SDK defers to the Claude Code binary's prompt; here we ship our own.
+// SDK defers to the Claude Code binary's prompt; here we ship our own. The
+// harness appends environment info, project context, and the memory index —
+// see core/system-prompt.js.
 export const SYSTEM_PROMPT = `You are OpenRouter Code Agent, a pragmatic coding agent running in a local workspace.
 
 Work like a CLI coding assistant:
 - Inspect files with tools before making claims about the codebase.
 - Use Glob/Grep to search code, and WebSearch/WebFetch when the answer depends on current external docs.
-- Keep a todo list with TodoWrite for multi-step tasks.
-- Prefer small, targeted edits.
-- Use Edit for precise replacements and Write for new files.
+- For broad exploration or research whose intermediate output would flood your context, launch the Agent subagent tool and act on its summary.
+- Keep a todo list with TodoWrite for multi-step tasks; exactly one item in_progress at a time.
+- Prefer small, targeted edits. Use Edit for precise replacements and Write for new files.
 - Run commands only when needed to inspect or verify.
 - Never say a command or edit succeeded until the tool result confirms it.
+- If a tool call fails with INVALID INPUT, fix the arguments to match the schema and retry once.
 - Keep the final answer concise: changed files, verification, and any remaining risk.
 
 The user may choose any OpenRouter model. If the selected model is weak at tool calling, still follow the tool schemas exactly.`;
@@ -35,6 +40,7 @@ export function normalizeOptions(options = {}) {
 
     const allowed = resolveAllowed(options);
     const disallowed = options.disallowedTools || [];
+    const prompt = resolveSystemPrompt(options.systemPrompt);
 
     return {
         apiKey: options.apiKey ?? process.env.OPENROUTER_API_KEY,
@@ -46,10 +52,24 @@ export function normalizeOptions(options = {}) {
             DEFAULT_TIMEOUT_MS
         ),
 
-        systemPrompt: resolveSystemPrompt(options.systemPrompt),
+        systemPromptBase: prompt.base,
+        // Only the default/preset prompt gets harness sections (env, project
+        // context, memory) appended; a custom string prompt is sent as-is.
+        enrichSystemPrompt: prompt.enrich,
+        includeEnvInfo: options.includeEnvInfo !== false,
+        loadProjectContext: options.loadProjectContext !== false,
+        memory: options.memory !== false,
+
         allowedTools: allowed,
         disallowedTools: disallowed,
         builtinTools: selectTools(allowed, disallowed),
+        // SDK semantics: allowedTools entries are auto-approved (no prompt);
+        // disallowedTools entries are always refused. `Tool(spec)` scoping is
+        // honored — see permissions/rules.js.
+        allowRules: parseRules(allowed),
+        denyRules: parseRules(disallowed),
+
+        mcpServers: options.mcpServers || {},
 
         permissionMode,
         allowDangerouslySkipPermissions: Boolean(options.allowDangerouslySkipPermissions),
@@ -61,6 +81,14 @@ export function normalizeOptions(options = {}) {
         maxTokens: numberOrUndefined(options.maxTokens),
         reasoning: mapReasoning(options),
         verbosity: options.verbosity ?? process.env.OPENROUTER_VERBOSITY,
+
+        // Context window management (context/compaction.js).
+        maxContextTokens: numberOr(
+            options.maxContextTokens ?? process.env.OPENROUTER_MAX_CONTEXT_TOKENS,
+            DEFAULT_MAX_CONTEXT_TOKENS
+        ),
+        autoCompact: options.autoCompact !== false,
+        keepRecentMessages: numberOr(options.keepRecentMessages, 12),
 
         cwd: options.cwd || process.cwd(),
         additionalDirectories: options.additionalDirectories || [],
@@ -101,20 +129,36 @@ export function normalizeOptions(options = {}) {
 }
 
 export function resolveSystemPrompt(systemPrompt) {
-    if (!systemPrompt) return SYSTEM_PROMPT;
-    if (typeof systemPrompt === 'string') return systemPrompt;
+    if (!systemPrompt) return { base: SYSTEM_PROMPT, enrich: true };
+    if (typeof systemPrompt === 'string') return { base: systemPrompt, enrich: false };
     if (systemPrompt.type === 'preset' && systemPrompt.preset === 'claude_code') {
-        return systemPrompt.append ? `${SYSTEM_PROMPT}\n\n${systemPrompt.append}` : SYSTEM_PROMPT;
+        return {
+            base: systemPrompt.append
+                ? `${SYSTEM_PROMPT}\n\n${systemPrompt.append}`
+                : SYSTEM_PROMPT,
+            enrich: true,
+        };
     }
-    return SYSTEM_PROMPT;
+    return { base: SYSTEM_PROMPT, enrich: true };
 }
 
-// Filter the built-in tool definitions by allowed/disallowed lists. Matching is
-// by tool name, supporting the SDK's `Name(...)` scoping syntax (the scope is
-// ignored for definition selection; enforcement is left to canUseTool/hooks).
+// Filter the built-in tool definitions by allowed/disallowed lists.
+//
+// Entries WITHOUT a (spec) participate in selection: allowedTools restricts
+// the definition set; disallowedTools removes tools entirely. Entries WITH a
+// spec (e.g. "Bash(npm *)") are permission rules only and do not affect which
+// tools the model sees.
 export function selectTools(allowedTools = [], disallowedTools = []) {
-    const allow = allowedTools.map(baseToolName).filter(Boolean);
-    const deny = new Set(disallowedTools.map(baseToolName).filter(Boolean));
+    const allow = allowedTools
+        .filter((spec) => typeof spec === 'string' && !spec.includes('('))
+        .map((spec) => spec.trim())
+        .filter(Boolean);
+    const deny = new Set(
+        disallowedTools
+            .filter((spec) => typeof spec === 'string' && !spec.includes('('))
+            .map((spec) => spec.trim())
+            .filter(Boolean)
+    );
     return toolDefinitions.filter((tool) => {
         const name = tool.function?.name;
         if (deny.has(name)) return false;
@@ -147,12 +191,6 @@ function resolveAllowed(options) {
     }
     if (Array.isArray(options.tools)) return options.tools;
     return [];
-}
-
-function baseToolName(spec) {
-    if (typeof spec !== 'string') return '';
-    const open = spec.indexOf('(');
-    return (open === -1 ? spec : spec.slice(0, open)).trim();
 }
 
 function numberOr(value, fallback) {
