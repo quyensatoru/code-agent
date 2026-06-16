@@ -1,14 +1,36 @@
 // Read-only datastore inspection — so the agent can read realtime state when a
 // bug is in the data/infra, not the code. SQL (Postgres/MySQL/SQLite), Redis,
-// and MongoDB. Connection strings come from env (DATABASE_URL / REDIS_URL /
-// MONGODB_URL) or a `url` arg. Drivers are lazy-imported (no hard dependency);
-// a missing one returns an install hint. Every tool enforces read-only access.
+// MongoDB, and RabbitMQ. Connection strings come from env (DATABASE_URL /
+// REDIS_URL / MONGODB_URL / RABBITMQ_URL) or a `url` arg. Drivers are
+// lazy-imported (no hard dependency); a missing one returns an install hint.
+// Every tool enforces read-only access.
 //
-// RabbitMQ and other HTTP-managed services: use HttpProbe against their
-// management API (e.g. GET http://host:15672/api/queues with a Basic auth
-// header) — no dedicated driver needed.
+// RabbitMQ uses AMQP (amqplib): queue depth (passive check) and a
+// non-destructive peek (messages are requeued, never consumed). For the
+// management HTTP API (exchanges/bindings/overview) use HttpProbe against
+// e.g. GET http://host:15672/api/queues with a Basic auth header.
+//
+// Many configs? Give each connection an alias in .oragent/datasources.json (or
+// the DATASOURCES env) and pass `source:"<alias>"` instead of a raw url — see
+// src/tools/datasources.js and the DataSources tool.
+
+import { listDataSources, resolveSource } from './datasources.js';
+
+const SOURCE_PROP = {
+    type: 'string',
+    description: 'Named datasource alias (from .oragent/datasources.json / DATASOURCES env). Overrides env defaults; an explicit url overrides this. List them with the DataSources tool.',
+};
 
 export const dataToolDefinitions = [
+    {
+        type: 'function',
+        function: {
+            name: 'DataSources',
+            description:
+                'List configured datasource aliases (from .oragent/datasources.json and the DATASOURCES env) with type and host — credentials redacted. Use an alias as the "source" arg of SqlQuery / RedisCommand / MongoQuery / RabbitMQ instead of pasting a connection URL.',
+            parameters: { type: 'object', properties: {} },
+        },
+    },
     {
         type: 'function',
         function: {
@@ -20,6 +42,7 @@ export const dataToolDefinitions = [
                 required: ['query'],
                 properties: {
                     query: { type: 'string' },
+                    source: SOURCE_PROP,
                     url: { type: 'string', description: 'Override DATABASE_URL (postgres://, mysql://, sqlite:/file path).' },
                     max_rows: { type: 'integer', minimum: 1, maximum: 1000, default: 200 },
                 },
@@ -38,6 +61,7 @@ export const dataToolDefinitions = [
                 properties: {
                     command: { type: 'string' },
                     args: { type: 'array', items: { type: 'string' }, default: [] },
+                    source: SOURCE_PROP,
                     url: { type: 'string', description: 'Override REDIS_URL.' },
                 },
             },
@@ -63,16 +87,52 @@ export const dataToolDefinitions = [
                     pipeline: { type: 'array', items: { type: 'object' }, description: 'Stages for aggregate.' },
                     field: { type: 'string', description: 'Field for distinct.' },
                     limit: { type: 'integer', minimum: 1, maximum: 500, default: 50 },
+                    source: SOURCE_PROP,
                     url: { type: 'string', description: 'Override MONGODB_URL.' },
-                    db: { type: 'string', description: 'Override MONGODB_DB.' },
+                    db: { type: 'string', description: 'Override MONGODB_DB / source db.' },
+                },
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'RabbitMQ',
+            description:
+                'Inspect RabbitMQ over AMQP (READ-ONLY). operation "queue": passive check of a queue — returns messageCount + consumerCount (use it to see if messages are piling up or have no consumer). operation "peek": read up to N messages WITHOUT consuming them (they are requeued; redelivered flag/order may change). Connection from RABBITMQ_URL/AMQP_URL or the url arg. For exchanges/bindings/overview use HttpProbe against the management API (port 15672).',
+            parameters: {
+                type: 'object',
+                required: ['queue'],
+                properties: {
+                    operation: {
+                        type: 'string',
+                        enum: ['queue', 'peek'],
+                        default: 'queue',
+                    },
+                    queue: { type: 'string', description: 'Queue name.' },
+                    count: {
+                        type: 'integer',
+                        minimum: 1,
+                        maximum: 50,
+                        default: 5,
+                        description: 'peek: number of messages to read (non-destructively requeued).',
+                    },
+                    source: SOURCE_PROP,
+                    url: { type: 'string', description: 'Override RABBITMQ_URL (amqp://user:pass@host:5672).' },
                 },
             },
         },
     },
 ];
 
-export function createDataHandlers() {
-    return { SqlQuery: sqlQuery, RedisCommand: redisCommand, MongoQuery: mongoQuery };
+export function createDataHandlers({ cwd = process.cwd() } = {}) {
+    return {
+        DataSources: () => listDataSources(cwd),
+        SqlQuery: (args) => sqlQuery(args, cwd),
+        RedisCommand: (args) => redisCommand(args, cwd),
+        MongoQuery: (args) => mongoQuery(args, cwd),
+        RabbitMQ: (args) => rabbitMq(args, cwd),
+    };
 }
 
 // --- SQL ---
@@ -97,8 +157,10 @@ export function assertReadOnlySql(sql) {
     return stripped;
 }
 
-async function sqlQuery({ query, url = process.env.DATABASE_URL, max_rows: maxRows = 200 }) {
-    if (!url) throw new Error('No database URL. Set DATABASE_URL or pass url.');
+async function sqlQuery({ query, url, source, max_rows: maxRows = 200 }, cwd) {
+    const entry = await resolveSource(source, cwd, 'sql');
+    url = url || entry?.url || process.env.DATABASE_URL;
+    if (!url) throw new Error('No database URL. Set DATABASE_URL, pass url, or use source.');
     const sql = assertReadOnlySql(query);
     const scheme = url.split(':')[0].toLowerCase();
     if (scheme === 'postgres' || scheme === 'postgresql') return pgQuery(url, sql, maxRows);
@@ -161,8 +223,10 @@ export function assertReadOnlyRedis(command) {
     return cmd;
 }
 
-async function redisCommand({ command, args = [], url = process.env.REDIS_URL }) {
-    if (!url) throw new Error('No Redis URL. Set REDIS_URL or pass url.');
+async function redisCommand({ command, args = [], url, source }, cwd) {
+    const entry = await resolveSource(source, cwd, 'redis');
+    url = url || entry?.url || process.env.REDIS_URL;
+    if (!url) throw new Error('No Redis URL. Set REDIS_URL, pass url, or use source.');
     const cmd = assertReadOnlyRedis(command);
     const redis = defaultOf(await lazy('redis'));
     const client = redis.createClient({ url });
@@ -193,10 +257,14 @@ async function mongoQuery({
     pipeline = [],
     field,
     limit = 50,
-    url = process.env.MONGODB_URL || process.env.MONGO_URL,
-    db = process.env.MONGODB_DB,
-}) {
-    if (!url) throw new Error('No Mongo URL. Set MONGODB_URL or pass url.');
+    url,
+    db,
+    source,
+}, cwd) {
+    const entry = await resolveSource(source, cwd, 'mongo');
+    url = url || entry?.url || process.env.MONGODB_URL || process.env.MONGO_URL;
+    db = db || entry?.db || process.env.MONGODB_DB;
+    if (!url) throw new Error('No Mongo URL. Set MONGODB_URL, pass url, or use source.');
     const mongodb = await lazy('mongodb');
     const MongoClient = (mongodb.default ?? mongodb).MongoClient;
     const client = new MongoClient(url);
@@ -224,6 +292,72 @@ async function mongoQuery({
     } finally {
         await client.close().catch(() => {});
     }
+}
+
+// --- RabbitMQ (AMQP, read-only) ---
+
+async function rabbitMq({ operation = 'queue', queue, count = 5, url, source }, cwd) {
+    const entry = await resolveSource(source, cwd, 'rabbitmq');
+    url = url || entry?.url || process.env.RABBITMQ_URL || process.env.AMQP_URL;
+    if (!url) throw new Error('No RabbitMQ URL. Set RABBITMQ_URL, pass url, or use source.');
+    if (!queue) throw new Error('queue is required');
+    const amqp = defaultOf(await lazy('amqplib'));
+    const conn = await amqp.connect(url);
+    try {
+        const channel = await conn.createChannel();
+        // Surface AMQP channel errors (e.g. queue not found) as the tool error
+        // instead of an unhandled 'error' event crashing the process.
+        channel.on('error', () => {});
+        try {
+            if (operation === 'queue') {
+                const ok = await channel.checkQueue(queue); // passive — read-only
+                return {
+                    queue: ok.queue,
+                    messageCount: ok.messageCount,
+                    consumerCount: ok.consumerCount,
+                };
+            }
+            if (operation === 'peek') {
+                const limit = Math.min(Math.max(Number(count) || 5, 1), 50);
+                const held = [];
+                for (let i = 0; i < limit; i += 1) {
+                    const msg = await channel.get(queue, { noAck: false });
+                    if (!msg) break;
+                    held.push(msg);
+                }
+                const messages = held.map(decodeAmqpMessage);
+                // Requeue everything — peek must not consume.
+                for (const msg of held) channel.nack(msg, false, true);
+                return { queue, peeked: messages.length, requeued: true, messages };
+            }
+            throw new Error(`Unsupported operation "${operation}"`);
+        } finally {
+            await channel.close().catch(() => {});
+        }
+    } finally {
+        await conn.close().catch(() => {});
+    }
+}
+
+function decodeAmqpMessage(msg) {
+    const text = msg.content ? msg.content.toString('utf8') : '';
+    let body;
+    try {
+        body = JSON.parse(text);
+    } catch {
+        body = text.length > 2000 ? `${text.slice(0, 2000)}…[truncated]` : text;
+    }
+    const props = msg.properties || {};
+    return {
+        routing_key: msg.fields?.routingKey,
+        exchange: msg.fields?.exchange,
+        redelivered: msg.fields?.redelivered,
+        content_type: props.contentType,
+        message_id: props.messageId,
+        timestamp: props.timestamp,
+        headers: props.headers,
+        body,
+    };
 }
 
 // --- shared ---

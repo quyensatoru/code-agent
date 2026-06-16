@@ -136,7 +136,7 @@ export function createToolRuntime({
         ...createGitHandlers({ root }),
         ...createSandboxHandlers(),
         ...createBrowserHandlers({ root }),
-        ...createDataHandlers(),
+        ...createDataHandlers({ cwd: root }),
         ...createTodoHandlers(),
         ...createWebHandlers(),
         ...createAgentHandlers({ queryOptions, onEvent }),

@@ -27,9 +27,12 @@ export const TOOL_META = {
     // HttpProbe is restricted to idempotent methods (GET/HEAD/OPTIONS).
     HttpProbe: { readOnly: true, permission: 'read' },
     // Datastore inspection tools enforce read-only access internally.
+    DataSources: { readOnly: true, permission: 'read' },
     SqlQuery: { readOnly: true, permission: 'read' },
     RedisCommand: { readOnly: true, permission: 'read' },
     MongoQuery: { readOnly: true, permission: 'read' },
+    // RabbitMQ peeks via AMQP and requeues — never consumes (read-only).
+    RabbitMQ: { readOnly: true, permission: 'read' },
     Write: { readOnly: false, permission: 'edit' },
     Edit: { readOnly: false, permission: 'edit' },
     Bash: { readOnly: false, permission: 'bash' },
