@@ -26,6 +26,7 @@ try {
   else if (command === "sessions") await printSessions(options);
   else if (command === "serve") await serve(options);
   else if (command === "chat") await chat(options);
+  else if (command === "support") await support(rest.join(" "), options);
   else await run(rest.join(" "), options);
 } catch (error) {
   console.error(`Error: ${error.message}`);
@@ -36,6 +37,77 @@ async function run(prompt, options) {
   if (!prompt && !hasAttachments(options)) return printHelp();
   const sessionId = await drive(prompt || "Describe and use the attached context.", buildOptions(options));
   console.log(`\nSession: ${sessionId}`);
+}
+
+// Shopify embedded-app support agent: provision the workspace from a GitLab
+// group on first run (clone the repos the user picks), then diagnose a
+// forwarded issue across the stack and auto-route a code bug into the fix flow
+// (unless --no-fix). The agent + sandbox run with cwd = workspace root.
+async function support(issue, options) {
+  if (!issue) {
+    console.error('Usage: oragent support "<merchant issue>" [--shop my-store.myshopify.com] [--group <id>] [--workspace <dir>] [--no-fix]');
+    return;
+  }
+  const { runSupport } = await import("../src/support/index.js");
+  const workspace = await ensureWorkspace(options);
+  const sdk = buildOptions({ ...options, cwd: workspace });
+  if (options.shop) process.env.SHOPIFY_SHOP = options.shop;
+
+  const { diagnosis, summary, fix } = await runSupport({
+    issue,
+    options: { ...sdk, autoFix: !options.noFix },
+  });
+
+  if (diagnosis) {
+    console.log(`\n=== Diagnosis ===`);
+    console.log(`layer:      ${diagnosis.layer}`);
+    console.log(`route:      ${diagnosis.route} (confidence: ${diagnosis.confidence})`);
+    console.log(`root cause: ${diagnosis.root_cause}`);
+    if (diagnosis.recommended_action) console.log(`action:     ${diagnosis.recommended_action}`);
+    if (diagnosis.fix_target) console.log(`fix target: ${diagnosis.fix_target}`);
+    if (diagnosis.evidence?.length) console.log(`evidence:\n  - ${diagnosis.evidence.join("\n  - ")}`);
+  } else {
+    console.log(`\n${summary}`);
+  }
+  if (fix) console.log(`\n=== Fix handoff ===\n${fix.result}`);
+  console.error(`\n[workspace] ${workspace}`);
+}
+
+// Ensure the workspace is provisioned from a GitLab group before the agent
+// runs. On first run (no marker) it asks for the group id if not given via
+// --group, lists the group's direct repos, lets the user tick which to clone,
+// then clones into <workspace>/<group>/<repo>. Returns the workspace dir.
+async function ensureWorkspace(options) {
+  const { provisionWorkspace, isProvisioned, parseSelection } = await import("../src/workspace/index.js");
+  const workspace = path.resolve(options.workspace || process.env.WORKSPACE_DIR || "./workspaces");
+
+  if (!options.reprovision && (await isProvisioned(workspace))) return workspace;
+  if (!process.env.GITLAB_TOKEN) {
+    throw new Error("Set GITLAB_TOKEN in env to provision the workspace from GitLab.");
+  }
+
+  const rl = readline.createInterface({ input, output });
+  try {
+    let group = options.group;
+    if (!group) group = (await rl.question("GitLab group id or path: ")).trim();
+    if (!group) throw new Error("A group is required to provision the workspace.");
+
+    const result = await provisionWorkspace({
+      workspace,
+      group,
+      onLog: (message) => console.error(`[workspace] ${message}`),
+      selectProjects: async (projects) => {
+        console.error(`\nRepos in group "${group}":`);
+        projects.forEach((p, i) => console.error(`  ${i + 1}. ${p.path}  (${p.name})`));
+        const answer = (await rl.question("Select repos to clone (e.g. 1,3-5 or 'all'): ")).trim();
+        return parseSelection(answer, projects.length).map((i) => projects[i - 1]);
+      },
+    });
+    console.error(`[workspace] ready: ${result.repos.length} repo(s) under ${workspace}/${result.group}`);
+  } finally {
+    rl.close();
+  }
+  return workspace;
 }
 
 async function chat(options) {
@@ -346,7 +418,7 @@ function truncate(text, max) {
 }
 
 function parseArgs(argv) {
-  const commands = new Set(["help", "tools", "models", "sessions", "serve", "chat"]);
+  const commands = new Set(["help", "tools", "models", "sessions", "serve", "chat", "support"]);
   let command = "run";
   const rest = [];
   const options = {};
@@ -388,11 +460,18 @@ function printHelp() {
 
 Usage:
   oragent "fix the bug in src/app.js"
+  oragent support "merchant can't see the widget on their store" --shop my-store.myshopify.com
   oragent chat
   oragent serve --port 3333
   oragent models --limit 20
   oragent tools
   oragent sessions
+
+Shopify support agent (diagnose across the stack, then route a code bug to the fix flow):
+  oragent support "<merchant issue>" [--shop <domain>] [--group <id>] [--workspace <dir>] [--no-fix] [--reprovision]
+    First run provisions a workspace: asks for the GitLab group (or --group), lists its
+    repos, lets you pick which to clone into <workspace>/<group>/<repo>, then runs the agent
+    there. Needs GITLAB_TOKEN (and GITLAB_URL for self-hosted) in env. Default workspace: ./workspaces
 
 Options (mapped to SDK query() Options):
   --model <id>                       OpenRouter model slug (planner)

@@ -11,6 +11,10 @@ export { estimateTokens } from './context/compaction.js';
 export { MEMORY_DIR, loadMemoryIndex } from './memory/index.js';
 export { listSessions } from './sessions/index.js';
 export { createServer, startServer } from './server/index.js';
+export { runSupport } from './support/index.js';
+export { SHOPIFY_SUPPORT_PROMPT } from './support/prompt.js';
+export { provisionWorkspace, isProvisioned, readWorkspace, parseSelection } from './workspace/index.js';
+export { listGroupProjects, getGroup } from './workspace/gitlab.js';
 export { runAgent } from './legacy.js';
 
 export const VERSION = '0.2.0';

@@ -14,6 +14,8 @@ import { dataToolDefinitions, createDataHandlers } from './data.js';
 import { codebaseToolDefinitions, createCodebaseHandlers } from './codebase.js';
 import { triageToolDefinitions, createTriageHandlers } from './triage.js';
 import { hypothesisToolDefinitions, createHypothesisHandlers } from './hypothesis.js';
+import { diagnosisToolDefinitions, createDiagnosisHandlers } from './diagnosis.js';
+import { shopifyToolDefinitions, createShopifyHandlers } from './shopify.js';
 
 export { TOOL_META } from './meta.js';
 
@@ -24,6 +26,7 @@ export const toolDefinitions = [
     ...triageToolDefinitions,
     ...codebaseToolDefinitions,
     ...hypothesisToolDefinitions,
+    ...diagnosisToolDefinitions,
     ...searchToolDefinitions,
     ...fsToolDefinitions,
     ...shellToolDefinitions,
@@ -31,6 +34,7 @@ export const toolDefinitions = [
     ...sandboxToolDefinitions,
     ...browserToolDefinitions,
     ...dataToolDefinitions,
+    ...shopifyToolDefinitions,
     ...todoToolDefinitions,
     ...webToolDefinitions,
     ...agentToolDefinitions,
@@ -130,6 +134,8 @@ export function createToolRuntime({
         ...createCodebaseHandlers({ root, resolvePath, getMatcher: () => ignoreMatcherPromise }),
         ...createTriageHandlers(),
         ...createHypothesisHandlers(),
+        ...createDiagnosisHandlers(),
+        ...createShopifyHandlers(),
         ...createSearchHandlers({ root, resolvePath, getMatcher: () => ignoreMatcherPromise }),
         ...createFsHandlers({ root, resolvePath }),
         ...createShellHandlers({ root }),

@@ -8,6 +8,11 @@ Repo này **không** copy binary/source proprietary. Nó clone **practical core*
 (query loop, message taxonomy, Options, tool names, permission modes, hooks, reasoning) và bổ sung
 các thành phần harness thực thụ: **memory, context compaction, permission rules, subagent, custom tools**.
 
+Trên nền harness đó còn có **Shopify embedded-app support agent** (`oragent support` / `runSupport`):
+nhận issue do supporter chuyển tới, chẩn đoán lỗi nằm ở tầng nào trong cả stack (theme app extension,
+storefront script, admin App Bridge UI, app backend, infra, Shopify platform), rồi **tự route** một
+code-bug sang chính query() fix flow ở trên. Xem mục [Shopify support agent](#shopify-support-agent).
+
 ## Cấu trúc repo (harness pattern)
 
 ```
@@ -29,7 +34,9 @@ src/
     meta.js               TOOL_META (permission class per tool)
     validate.js           JSON-schema validation + coercion cho tool args
     triage.js             TriageIssue — biến report mơ hồ thành brief + unknowns
-    data.js               SqlQuery/RedisCommand/MongoQuery — đọc realtime data (read-only)
+    diagnosis.js          ReportDiagnosis — kết luận tầng lỗi + route (support agent)
+    shopify.js            ShopifyAdminGraphQL — đọc state shop qua Admin API (read-only)
+    data.js               SqlQuery/RedisCommand/MongoQuery/RabbitMQ — đọc realtime data (read-only)
     codebase.js           CodebaseMap (orient) + TraceDeps (imports) + TraceCalls (call graph)
     hypothesis.js         Hypothesize — ghi phỏng đoán root-cause trước khi search
     search.js             Glob/Grep/list_files/print_tree (.gitignore-aware)
@@ -53,6 +60,12 @@ src/
   memory/index.js        Persistent memory (.oragent/memory/MEMORY.md)
   sessions/index.js      Session persist/resume (.oragent/sessions)
   server/index.js        Express API
+  support/               Shopify support agent
+    prompt.js              SHOPIFY_SUPPORT_PROMPT (taxonomy 5 tầng + check-map)
+    index.js               runSupport(): diagnose → auto-route code_fix sang query()
+  workspace/             Provision workspace từ GitLab group
+    gitlab.js              GitLab REST v4: list group projects + clone (token-scrub)
+    index.js               provisionWorkspace() + isProvisioned + parseSelection
   utils/env.js           .env loader
 ```
 
@@ -190,6 +203,38 @@ query({ prompt: "làm tiếp đi", options: { ...options, resume: sessionId } })
 - **CLI**: Ctrl+C lần 1 ngắt run hiện tại (session được lưu, in hướng dẫn resume); Ctrl+C lần 2 thoát. Resume bằng `--resume <id>` (hoặc `--session <id>`).
 - **Server**: xem bên dưới.
 
+## Shopify support agent
+
+Tầng điều phối đứng **trước** phần fix-bug: nhận issue mà supporter chuyển tới, chẩn đoán lỗi nằm ở **tầng nào** trong cả stack, chứng minh bằng evidence, rồi **tự route** code-bug sang query() fix flow.
+
+```sh
+oragent support "merchant báo widget không hiện trên store" --shop my-store.myshopify.com
+oragent support "trang admin app trắng xoá" --shop my-store --no-fix   # chỉ chẩn đoán, không tự fix
+```
+
+**Workspace từ GitLab (lần chạy đầu):** `oragent support` provision workspace ngầm — nếu chưa có, nó hỏi GitLab group (hoặc `--group`), liệt kê repo trực tiếp trong group, cho bạn **tích chọn** repo cần clone (`1,3-5` hoặc `all`), clone vào `<workspace>/<group>/<repo>`, rồi chạy agent với **cwd = workspace root** (thấy mọi repo đã clone). Lần sau tái dùng workspace (marker `.oragent/workspace.json`); `--reprovision` để clone lại. Cần `GITLAB_TOKEN` trong env (`GITLAB_URL` cho self-hosted). Token chỉ dùng lúc clone rồi được xoá khỏi `.git/config`.
+
+```sh
+GITLAB_TOKEN=glpat-… oragent support "widget không hiện" --group my-team --shop my-store.myshopify.com
+```
+
+Quy trình (system prompt ở [src/support/prompt.js](src/support/prompt.js)): `Provision workspace → Triage → Gather evidence theo từng tầng → ReportDiagnosis (1 lần) → (nếu code_fix) handoff sang fix flow`.
+
+Taxonomy tầng lỗi và cách kiểm tra:
+
+| Layer | Triệu chứng | Check bằng |
+|---|---|---|
+| `theme_app_extension` | App embed/block tắt → storefront không render | BrowserSnapshot storefront + ShopifyAdminGraphQL (trạng thái extension) |
+| `storefront_script` | Script/app-proxy chạy sai | BrowserSnapshot network log + console |
+| `admin_embedded_ui` | UI admin nhúng (App Bridge) lỗi | BrowserSnapshot app URL + backend response |
+| `app_backend` | App server 5xx / throw | HttpProbe health + SqlQuery/MongoQuery state shop |
+| `app_infra` | Quá tải/sập: DB/Redis/queue nghẽn | RedisCommand, RabbitMQ, SqlQuery, HttpProbe |
+| `shopify_platform` | Install/scopes/webhooks/billing hoặc sự cố Shopify | ShopifyAdminGraphQL + DB token row + status page |
+
+`ReportDiagnosis` trả `{ layer, root_cause, evidence[], confidence, route, recommended_action, fix_target }`. `route=code_fix` (+ không `--no-fix`) → tự chạy query() fix end-to-end; route khác → trả hành động cho supporter (vd nhờ merchant bật app embed).
+
+**Lấy Admin API token theo shop**: agent đọc token từ DB app trước (SqlQuery/MongoQuery trên bảng shops theo domain) rồi truyền `shop`+`access_token` cho `ShopifyAdminGraphQL`; hoặc đặt `SHOPIFY_SHOP`/`SHOPIFY_ACCESS_TOKEN` để test 1 shop. Library: `import { runSupport } from "openrouter-code-agent"` → `runSupport({ issue, options })` trả `{ diagnosis, summary, sessionId, fix }`.
+
 ## Express API
 
 ```sh
@@ -226,7 +271,7 @@ vì không có TTY để xác nhận permission.
 ## Built-in tools (SDK names)
 
 `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `TodoWrite`, `WebFetch`, `WebSearch`, `Agent`
-(+ extras không thuộc SDK: `TriageIssue`, `CodebaseMap`, `TraceDeps`, `TraceCalls`, `Hypothesize`, `HttpProbe`, `BrowserSnapshot`, `SqlQuery`, `RedisCommand`, `MongoQuery`, `list_files`, `print_tree`, `TodoRead`, `Git`, `RunCode`).
+(+ extras không thuộc SDK: `TriageIssue`, `ReportDiagnosis`, `CodebaseMap`, `TraceDeps`, `TraceCalls`, `Hypothesize`, `HttpProbe`, `BrowserSnapshot`, `ShopifyAdminGraphQL`, `SqlQuery`, `RedisCommand`, `MongoQuery`, `RabbitMQ`, `DataSources`, `list_files`, `print_tree`, `TodoRead`, `Git`, `RunCode`).
 
 Issue intake & evidence (dựng "hình thù" issue TRƯỚC khi đoán nguyên nhân):
 

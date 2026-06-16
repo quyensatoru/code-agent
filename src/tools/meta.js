@@ -8,6 +8,7 @@ export const TOOL_META = {
     TraceDeps: { readOnly: true, permission: 'read' },
     TraceCalls: { readOnly: true, permission: 'read' },
     Hypothesize: { readOnly: true, permission: 'read' },
+    ReportDiagnosis: { readOnly: true, permission: 'read' },
     Read: { readOnly: true, permission: 'read' },
     Glob: { readOnly: true, permission: 'read' },
     Grep: { readOnly: true, permission: 'read' },
@@ -26,6 +27,8 @@ export const TOOL_META = {
     BrowserSnapshot: { readOnly: true, permission: 'read' },
     // HttpProbe is restricted to idempotent methods (GET/HEAD/OPTIONS).
     HttpProbe: { readOnly: true, permission: 'read' },
+    // Shopify Admin GraphQL is restricted to read-only queries (no mutations).
+    ShopifyAdminGraphQL: { readOnly: true, permission: 'read' },
     // Datastore inspection tools enforce read-only access internally.
     DataSources: { readOnly: true, permission: 'read' },
     SqlQuery: { readOnly: true, permission: 'read' },
