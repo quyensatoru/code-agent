@@ -10,15 +10,18 @@ import { agentToolDefinitions, createAgentHandlers } from './agent.js';
 import { gitToolDefinitions, createGitHandlers } from './git.js';
 import { sandboxToolDefinitions, createSandboxHandlers } from './sandbox.js';
 import { browserToolDefinitions, createBrowserHandlers } from './browser.js';
+import { dataToolDefinitions, createDataHandlers } from './data.js';
 import { codebaseToolDefinitions, createCodebaseHandlers } from './codebase.js';
+import { triageToolDefinitions, createTriageHandlers } from './triage.js';
 import { hypothesisToolDefinitions, createHypothesisHandlers } from './hypothesis.js';
 
 export { TOOL_META } from './meta.js';
 
-// All built-in tool definitions, in the order the model sees them. Orientation
-// and hypothesis tools come first so an unfamiliar codebase is mapped and the
-// root cause is predicted before it is grepped.
+// All built-in tool definitions, in the order the model sees them. The
+// investigation tools come first in protocol order — triage the issue, map the
+// codebase, then hypothesize — so the model orients before it greps.
 export const toolDefinitions = [
+    ...triageToolDefinitions,
     ...codebaseToolDefinitions,
     ...hypothesisToolDefinitions,
     ...searchToolDefinitions,
@@ -27,6 +30,7 @@ export const toolDefinitions = [
     ...gitToolDefinitions,
     ...sandboxToolDefinitions,
     ...browserToolDefinitions,
+    ...dataToolDefinitions,
     ...todoToolDefinitions,
     ...webToolDefinitions,
     ...agentToolDefinitions,
@@ -124,6 +128,7 @@ export function createToolRuntime({
 
     const handlers = {
         ...createCodebaseHandlers({ root, resolvePath, getMatcher: () => ignoreMatcherPromise }),
+        ...createTriageHandlers(),
         ...createHypothesisHandlers(),
         ...createSearchHandlers({ root, resolvePath, getMatcher: () => ignoreMatcherPromise }),
         ...createFsHandlers({ root, resolvePath }),
@@ -131,6 +136,7 @@ export function createToolRuntime({
         ...createGitHandlers({ root }),
         ...createSandboxHandlers(),
         ...createBrowserHandlers({ root }),
+        ...createDataHandlers(),
         ...createTodoHandlers(),
         ...createWebHandlers(),
         ...createAgentHandlers({ queryOptions, onEvent }),

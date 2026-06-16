@@ -22,7 +22,10 @@ function coerceObject(schema, input, path, errors) {
     }
     const out = { ...input };
     for (const key of schema.required || []) {
-        if (out[key] === undefined || out[key] === null || out[key] === '') {
+        // "present" means not undefined/null. An empty string is a valid value
+        // (e.g. Edit's `replace: ""` to delete text); tools reject emptiness
+        // themselves where it matters.
+        if (out[key] === undefined || out[key] === null) {
             errors.push(`missing required parameter "${joinPath(path, key)}"`);
         }
     }

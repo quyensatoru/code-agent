@@ -43,10 +43,60 @@ export const webToolDefinitions = [
             },
         },
     },
+    {
+        type: 'function',
+        function: {
+            name: 'HttpProbe',
+            description:
+                'Probe an HTTP endpoint or asset directly and return the raw status, headers, timing, and body — to evidence an issue (e.g. does the heatmap data API return 200/empty/CORS-blocked?). Read-only: GET/HEAD/OPTIONS only. Pass headers to send a Cookie/Authorization for authed targets. For non-idempotent reproduction (POST/PUT/DELETE) use Bash + curl instead.',
+            parameters: {
+                type: 'object',
+                required: ['url'],
+                properties: {
+                    url: { type: 'string' },
+                    method: { type: 'string', enum: ['GET', 'HEAD', 'OPTIONS'], default: 'GET' },
+                    headers: {
+                        type: 'object',
+                        description: 'Request headers, e.g. { "Cookie": "...", "Authorization": "Bearer ..." }.',
+                    },
+                    max_body_chars: { type: 'integer', minimum: 0, maximum: 60000, default: 8000 },
+                },
+            },
+        },
+    },
 ];
 
 export function createWebHandlers() {
-    return { WebFetch: webFetch, WebSearch: webSearch };
+    return { WebFetch: webFetch, WebSearch: webSearch, HttpProbe: httpProbe };
+}
+
+async function httpProbe({ url, method = 'GET', headers = {}, max_body_chars: maxBody = 8000 }) {
+    const target = parseHttpUrl(url);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    const startedAt = Date.now();
+    try {
+        const response = await fetch(target, {
+            method,
+            headers: { 'user-agent': USER_AGENT, ...headers },
+            signal: controller.signal,
+            redirect: 'manual',
+        });
+        const raw = method === 'HEAD' ? '' : await response.text();
+        return {
+            url: target,
+            method,
+            status: response.status,
+            ok: response.ok,
+            timing_ms: Date.now() - startedAt,
+            content_type: response.headers.get('content-type') || '',
+            headers: Object.fromEntries(response.headers.entries()),
+            body: maxBody > 0 ? truncate(raw, maxBody) : undefined,
+            body_truncated: raw.length > maxBody,
+        };
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
 async function webFetch({ url, max_chars: maxChars = 16000 }) {

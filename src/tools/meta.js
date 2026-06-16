@@ -3,6 +3,7 @@
 // runtime executes them. Kept in its own module so the permission layer can
 // import it without pulling in tool implementations (avoids import cycles).
 export const TOOL_META = {
+    TriageIssue: { readOnly: true, permission: 'read' },
     CodebaseMap: { readOnly: true, permission: 'read' },
     TraceDeps: { readOnly: true, permission: 'read' },
     TraceCalls: { readOnly: true, permission: 'read' },
@@ -23,6 +24,12 @@ export const TOOL_META = {
     Git: { readOnly: true, permission: 'read' },
     // BrowserSnapshot only loads a URL and observes — same class as WebFetch.
     BrowserSnapshot: { readOnly: true, permission: 'read' },
+    // HttpProbe is restricted to idempotent methods (GET/HEAD/OPTIONS).
+    HttpProbe: { readOnly: true, permission: 'read' },
+    // Datastore inspection tools enforce read-only access internally.
+    SqlQuery: { readOnly: true, permission: 'read' },
+    RedisCommand: { readOnly: true, permission: 'read' },
+    MongoQuery: { readOnly: true, permission: 'read' },
     Write: { readOnly: false, permission: 'edit' },
     Edit: { readOnly: false, permission: 'edit' },
     Bash: { readOnly: false, permission: 'bash' },

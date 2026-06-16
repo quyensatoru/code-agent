@@ -118,7 +118,21 @@ export function createFsHandlers({ root, resolvePath }) {
     async function editFile(file, { search, replace, replace_all: replaceAll = false }) {
         if (!search) throw new Error('search must be non-empty');
         const before = await fs.readFile(file, 'utf8');
-        const count = before.split(search).length - 1;
+
+        // The model emits \n, but a file on disk may use \r\n (Windows / git
+        // autocrlf). Align the search/replace line endings to the file so an
+        // exact match isn't missed.
+        let needle = search;
+        let value = replace ?? '';
+        if (before.includes('\r\n') && !needle.includes('\r\n')) {
+            needle = needle.replace(/\n/g, '\r\n');
+            value = value.replace(/\n/g, '\r\n');
+        } else if (!before.includes('\r\n') && needle.includes('\r\n')) {
+            needle = needle.replace(/\r\n/g, '\n');
+            value = value.replace(/\r\n/g, '\n');
+        }
+
+        const count = before.split(needle).length - 1;
         if (!count) {
             throw new Error(
                 'search text not found in file. Read the file and pass the exact text, including whitespace.'
@@ -129,10 +143,10 @@ export function createFsHandlers({ root, resolvePath }) {
                 `search text appears ${count} times — include more surrounding lines to make it unique, or set replace_all=true`
             );
         }
-        const after = replaceAll
-            ? before.split(search).join(replace ?? '')
-            : before.replace(search, replace ?? '');
+        // split/join replaces literally (no $-pattern interpretation) and, since
+        // a non-replace_all edit requires a unique match, handles both cases.
+        const after = before.split(needle).join(value);
         await fs.writeFile(file, after, 'utf8');
-        return { path: path.relative(root, file), replacements: replaceAll ? count : 1 };
+        return { path: path.relative(root, file), replacements: count };
     }
 }

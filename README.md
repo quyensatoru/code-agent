@@ -28,6 +28,8 @@ src/
     index.js              Registry, runtime dispatch, validation, MCP routing
     meta.js               TOOL_META (permission class per tool)
     validate.js           JSON-schema validation + coercion cho tool args
+    triage.js             TriageIssue — biến report mơ hồ thành brief + unknowns
+    data.js               SqlQuery/RedisCommand/MongoQuery — đọc realtime data (read-only)
     codebase.js           CodebaseMap (orient) + TraceDeps (imports) + TraceCalls (call graph)
     hypothesis.js         Hypothesize — ghi phỏng đoán root-cause trước khi search
     search.js             Glob/Grep/list_files/print_tree (.gitignore-aware)
@@ -59,7 +61,9 @@ src/
 | Thành phần | Cơ chế |
 |---|---|
 | **Agent loop** | `query()` → system init → assistant → tool_result → … → result |
-| **Investigation workflow** | Protocol `Orient → Hypothesize → Locate → Change → Verify` trong system prompt: `CodebaseMap` map cấu trúc 1-lần-gọi; `Hypothesize` buộc agent ghi phỏng đoán root-cause + prediction + cách kiểm chứng trước khi search; `TraceDeps` (import/dependents) + `TraceCalls` (execution path: ai gọi hàm này tới tận entry point) |
+| **Investigation workflow** | Protocol `Triage → Gather evidence → Hypothesize → Locate → Change → Verify` trong system prompt: `TriageIssue` biến report mơ hồ thành brief + danh sách unknowns; thu thập evidence (`BrowserSnapshot`/`HttpProbe`/`CodebaseMap`) lấp unknowns; `Hypothesize` chỉ chạy sau khi unknowns đã được trả lời; `TraceDeps` (import/dependents) + `TraceCalls` (execution path) |
+| **Issue intake & evidence** | `TriageIssue` (brief + unknowns), `HttpProbe` (probe endpoint/asset trực tiếp, GET/HEAD/OPTIONS + header inject), `BrowserSnapshot` v2 (network log + response body XHR/fetch, console errors, actions click/type/wait, inject cookie/header/localStorage cho target authed, screenshot) — để dựng lại "hình thù" issue trước khi đoán nguyên nhân |
+| **Realtime data/infra** | `SqlQuery` (Postgres/MySQL/SQLite, chỉ SELECT/EXPLAIN/SHOW…), `RedisCommand` (chỉ lệnh đọc), `MongoQuery` (find/count/aggregate/distinct, chặn `$out`/`$merge`) — đọc dữ liệu thật khi lỗi nằm ở data chứ không phải code. Config qua env, driver lazy-import. RabbitMQ & service quản trị HTTP: dùng `HttpProbe` vào management API |
 | **Stopping condition** | Circuit-breaker: đếm số lần explore (Grep/Read/Trace…) liên tiếp; sau `maxSearchSteps` (mặc định 16) không có edit/run/hypothesis → inject system nudge ép hội tụ, lặp lại mỗi `maxSearchSteps`. `maxTurns` là trần cứng |
 | **Tool calling** | Schema validation + coercion trước khi chạy; lỗi trả về dạng model tự sửa được; Edit bắt buộc search text unique (hoặc `replace_all`) |
 | **Permissions** | 4 mode (`default/plan/acceptEdits/bypassPermissions`) + rules `Tool(spec)`: `allowedTools:["Bash(npm *)"]` auto-allow, `disallowedTools:["Bash(rm *)"]` luôn deny; Bash read-only (git status/log/diff, ls, cat…) không cần hỏi |
@@ -71,7 +75,7 @@ src/
 | **Custom tools** | `tool()` + `createSdkMcpServer()` + `options.mcpServers` → execution được route thật, tên `mcp__<server>__<tool>` |
 | **Sessions** | Persist + `resume` qua `.oragent/sessions/<id>.json` |
 | **Interrupt** | `query()` trả về generator có `.interrupt()`; CLI: Ctrl+C; server: `POST /v1/query/:sessionId/interrupt`. Run bị ngắt vẫn persist → resume được |
-| **Runtime debug** | `Git` (inspect read-only, không prompt), `RunCode` (chạy snippet node/python cách ly), `BrowserSnapshot` (headless browser: console errors, failed requests, DOM text, screenshot) |
+| **Runtime debug** | `Git` (inspect read-only, không prompt), `RunCode` (chạy snippet node/python cách ly) — xem thêm `BrowserSnapshot`/`HttpProbe` ở Issue intake & evidence |
 | **Multimodal** | Perception 2-stage: omni model đọc media → text cho planner |
 
 **Out of scope** (so với SDK đầy đủ): Query control methods (`interrupt`/`setModel`/…), plugins,
@@ -222,9 +226,23 @@ vì không có TTY để xác nhận permission.
 ## Built-in tools (SDK names)
 
 `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `TodoWrite`, `WebFetch`, `WebSearch`, `Agent`
-(+ extras không thuộc SDK: `CodebaseMap`, `TraceDeps`, `TraceCalls`, `Hypothesize`, `list_files`, `print_tree`, `TodoRead`, `Git`, `RunCode`, `BrowserSnapshot`).
+(+ extras không thuộc SDK: `TriageIssue`, `CodebaseMap`, `TraceDeps`, `TraceCalls`, `Hypothesize`, `HttpProbe`, `BrowserSnapshot`, `SqlQuery`, `RedisCommand`, `MongoQuery`, `list_files`, `print_tree`, `TodoRead`, `Git`, `RunCode`).
 
-Orientation / điều tra (chạy TRƯỚC khi grep):
+Issue intake & evidence (dựng "hình thù" issue TRƯỚC khi đoán nguyên nhân):
+
+- `TriageIssue` — biến report mơ hồ của khách ("không xem được heatmap") thành brief có cấu trúc: `symptom`, `url`, `expected` vs `actual`, `repro`, `environment`, và **`unknowns[]`** (các sự kiện còn phải quan sát). Mỗi unknown là một mục tiêu thu thập evidence; chưa lấp hết thì chưa được Hypothesize.
+- `HttpProbe` — probe thẳng endpoint/asset: `{method(GET/HEAD/OPTIONS), url, headers}` → status/headers/timing/body. Check "API heatmap trả về gì", asset 200/403/CORS, có thể inject Cookie/Authorization cho target cần auth. Reproduce bằng POST/PUT → dùng `Bash` + curl (có gate).
+- `BrowserSnapshot` v2 — "mở DevTools và nhìn": **network log** (mọi request + status + **response body XHR/fetch**, lọc bằng `network_filter`), **console errors/warnings + page errors**, **actions** (`click/type/wait_for/goto/scroll`) tái hiện trạng thái nhiều bước, inject **cookie/header/localStorage** cho target authed, screenshot vào `.oragent/snapshots/`. Cần `playwright`/`puppeteer` (lazy import). Dùng cho lỗi web/UI mà HTML thô không thấy: trang trắng, lỗi JS, data load hỏng, element mất.
+
+Realtime data & infra (lỗi đôi khi ở hệ thống, không phải code):
+
+- `SqlQuery` — query READ-ONLY tới Postgres/MySQL/SQLite (`SELECT/WITH/EXPLAIN/SHOW/DESCRIBE/PRAGMA`), guard chặn mutate + single-statement, trả rows (cap `max_rows`). URL từ `DATABASE_URL` hoặc param (scheme chọn driver).
+- `RedisCommand` — chỉ lệnh đọc (`GET/HGETALL/LRANGE/KEYS/SCAN/TTL/INFO/…`); writes (`SET/DEL/FLUSH`) bị từ chối. URL từ `REDIS_URL`.
+- `MongoQuery` — `find/count/distinct/aggregate/listCollections`; chặn stage ghi `$out`/`$merge`. URL từ `MONGODB_URL` + `MONGODB_DB`.
+- **RabbitMQ & service quản trị HTTP**: không cần driver riêng — `HttpProbe` vào management API, vd `http://guest:guest@localhost:15672/api/queues` (depth, ready/unacked, consumers).
+- Driver (`pg`/`mysql2`/`better-sqlite3`/`redis`/`mongodb`) **lazy-import**, chỉ cài cái bạn dùng; thiếu thì tool trả hint cài đặt. Tất cả read-class (không prompt, chạy được plan mode).
+
+Orientation / điều tra code (chạy TRƯỚC khi grep):
 
 - `CodebaseMap` — overview cấu trúc 1-lần-gọi: ngôn ngữ, manifest + dependencies, entry points, key files, layout top-level kèm số file. Đây là bước "scan structure" — orient top-down thay vì đoán mò.
 - `Hypothesize` — ghi 1-4 phỏng đoán root-cause **trước khi search**: mỗi cái gồm `cause` (nguyên nhân nghi ngờ), `predicts` (nếu đúng thì sẽ quan sát thấy gì), `check` (1 phép kiểm chứng). Biến điều tra thành hypothesis-driven thay vì grep mò.
@@ -233,11 +251,11 @@ Orientation / điều tra (chạy TRƯỚC khi grep):
 
 Điểm dừng cho search: agent không grep/read mãi được. Sau `maxSearchSteps` lần explore liên tiếp (mặc định 16, đổi bằng `--max-search-steps` / `OPENROUTER_MAX_SEARCH_STEPS`, đặt 0 để tắt) mà không edit/run/Hypothesize, loop tự chèn 1 system message ép agent hội tụ (ghi hypothesis → kiểm chứng cái khả dĩ nhất → hành động). `maxTurns` vẫn là trần cứng.
 
-Runtime/UI debug:
+Runtime debug:
 
 - `Git` — inspect read-only (`status/diff/log/show/branch/remote/blame/stash list`) qua execFile, không shell, không bao giờ prompt (kể cả plan mode). Git mutations vẫn đi qua `Bash`.
 - `RunCode` — chạy script node/python độc lập trong **temp dir cách ly** + timeout, trả stdout/stderr/exit code. Dùng để reproduce bug, test regex/function. Được gate như Bash vì là thực thi code.
-- `BrowserSnapshot` — debug **UI web/snapshot**: mở URL bằng headless browser, trả console errors, page errors, failed requests (4xx/5xx), title, rendered text; lưu screenshot vào `.oragent/snapshots/`. Cần `npm i -D playwright && npx playwright install chromium` (hoặc `puppeteer`) — import lazy, không phải dependency cứng. Quy trình debug snapshot: chạy `BrowserSnapshot` lấy diagnostics dạng text → nếu cần "nhìn" ảnh, chạy lại với `--image .oragent/snapshots/<file>.png` để perception model đọc.
+- Cần "nhìn" ảnh screenshot: chạy lại với `--image .oragent/snapshots/<file>.png` để perception model đọc.
 
 - Mọi tool args được validate + coerce theo JSON schema trước khi chạy; sai schema trả về `INVALID INPUT …` để model tự sửa.
 - `Glob`/`Grep`/`list_files` tôn trọng `.gitignore` ở root và thư mục con; chỉ `.git/` luôn bị bỏ qua. `Grep` hỗ trợ `case_sensitive` + `context` lines.
