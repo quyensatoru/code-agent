@@ -7,14 +7,26 @@ import { shellToolDefinitions, createShellHandlers } from './shell.js';
 import { todoToolDefinitions, createTodoHandlers } from './todo.js';
 import { webToolDefinitions, createWebHandlers } from './web.js';
 import { agentToolDefinitions, createAgentHandlers } from './agent.js';
+import { gitToolDefinitions, createGitHandlers } from './git.js';
+import { sandboxToolDefinitions, createSandboxHandlers } from './sandbox.js';
+import { browserToolDefinitions, createBrowserHandlers } from './browser.js';
+import { codebaseToolDefinitions, createCodebaseHandlers } from './codebase.js';
+import { hypothesisToolDefinitions, createHypothesisHandlers } from './hypothesis.js';
 
 export { TOOL_META } from './meta.js';
 
-// All built-in tool definitions, in the order the model sees them.
+// All built-in tool definitions, in the order the model sees them. Orientation
+// and hypothesis tools come first so an unfamiliar codebase is mapped and the
+// root cause is predicted before it is grepped.
 export const toolDefinitions = [
+    ...codebaseToolDefinitions,
+    ...hypothesisToolDefinitions,
     ...searchToolDefinitions,
     ...fsToolDefinitions,
     ...shellToolDefinitions,
+    ...gitToolDefinitions,
+    ...sandboxToolDefinitions,
+    ...browserToolDefinitions,
     ...todoToolDefinitions,
     ...webToolDefinitions,
     ...agentToolDefinitions,
@@ -111,9 +123,14 @@ export function createToolRuntime({
     }
 
     const handlers = {
+        ...createCodebaseHandlers({ root, resolvePath, getMatcher: () => ignoreMatcherPromise }),
+        ...createHypothesisHandlers(),
         ...createSearchHandlers({ root, resolvePath, getMatcher: () => ignoreMatcherPromise }),
         ...createFsHandlers({ root, resolvePath }),
         ...createShellHandlers({ root }),
+        ...createGitHandlers({ root }),
+        ...createSandboxHandlers(),
+        ...createBrowserHandlers({ root }),
         ...createTodoHandlers(),
         ...createWebHandlers(),
         ...createAgentHandlers({ queryOptions, onEvent }),

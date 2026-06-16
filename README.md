@@ -28,9 +28,14 @@ src/
     index.js              Registry, runtime dispatch, validation, MCP routing
     meta.js               TOOL_META (permission class per tool)
     validate.js           JSON-schema validation + coercion cho tool args
+    codebase.js           CodebaseMap (orient) + TraceDeps (imports) + TraceCalls (call graph)
+    hypothesis.js         Hypothesize — ghi phỏng đoán root-cause trước khi search
     search.js             Glob/Grep/list_files/print_tree (.gitignore-aware)
     fs.js                 Read/Write/Edit
     shell.js              Bash
+    git.js                Git — read-only git inspection (execFile, no shell)
+    sandbox.js            RunCode — chạy snippet node/python trong temp dir cách ly
+    browser.js            BrowserSnapshot — headless browser debug UI (playwright/puppeteer)
     web.js                WebFetch/WebSearch (Tavily/DuckDuckGo)
     todo.js               TodoWrite/TodoRead
     agent.js              Agent — subagent (Task) tool
@@ -54,6 +59,8 @@ src/
 | Thành phần | Cơ chế |
 |---|---|
 | **Agent loop** | `query()` → system init → assistant → tool_result → … → result |
+| **Investigation workflow** | Protocol `Orient → Hypothesize → Locate → Change → Verify` trong system prompt: `CodebaseMap` map cấu trúc 1-lần-gọi; `Hypothesize` buộc agent ghi phỏng đoán root-cause + prediction + cách kiểm chứng trước khi search; `TraceDeps` (import/dependents) + `TraceCalls` (execution path: ai gọi hàm này tới tận entry point) |
+| **Stopping condition** | Circuit-breaker: đếm số lần explore (Grep/Read/Trace…) liên tiếp; sau `maxSearchSteps` (mặc định 16) không có edit/run/hypothesis → inject system nudge ép hội tụ, lặp lại mỗi `maxSearchSteps`. `maxTurns` là trần cứng |
 | **Tool calling** | Schema validation + coercion trước khi chạy; lỗi trả về dạng model tự sửa được; Edit bắt buộc search text unique (hoặc `replace_all`) |
 | **Permissions** | 4 mode (`default/plan/acceptEdits/bypassPermissions`) + rules `Tool(spec)`: `allowedTools:["Bash(npm *)"]` auto-allow, `disallowedTools:["Bash(rm *)"]` luôn deny; Bash read-only (git status/log/diff, ls, cat…) không cần hỏi |
 | **Hooks** | `PreToolUse` (block/rewrite input), `PostToolUse` (nhận `tool_response`), `UserPromptSubmit`, `Stop` (block = bắt agent làm tiếp), `SessionStart/End` |
@@ -63,6 +70,8 @@ src/
 | **Subagent** | Tool `Agent`: chạy `query()` lồng, plan-mode (read-only), context riêng, trả về câu trả lời cuối — giữ context cha sạch |
 | **Custom tools** | `tool()` + `createSdkMcpServer()` + `options.mcpServers` → execution được route thật, tên `mcp__<server>__<tool>` |
 | **Sessions** | Persist + `resume` qua `.oragent/sessions/<id>.json` |
+| **Interrupt** | `query()` trả về generator có `.interrupt()`; CLI: Ctrl+C; server: `POST /v1/query/:sessionId/interrupt`. Run bị ngắt vẫn persist → resume được |
+| **Runtime debug** | `Git` (inspect read-only, không prompt), `RunCode` (chạy snippet node/python cách ly), `BrowserSnapshot` (headless browser: console errors, failed requests, DOM text, screenshot) |
 | **Multimodal** | Perception 2-stage: omni model đọc media → text cho planner |
 
 **Out of scope** (so với SDK đầy đủ): Query control methods (`interrupt`/`setModel`/…), plugins,
@@ -164,6 +173,19 @@ Flags harness mới:
 - Đặt hướng dẫn dự án trong `ORAGENT.md` / `AGENTS.md` / `CLAUDE.md` ở root — tự nạp vào system prompt.
 - Agent có memory bền vững tại `.oragent/memory/`: mỗi memory là một file markdown nhỏ, `MEMORY.md` là index được nạp mỗi session. Agent tự cập nhật bằng Write/Edit (cần permission edit như thường lệ).
 
+## Interrupt & Resume
+
+```js
+const q = query({ prompt, options });
+setTimeout(() => q.interrupt(), 30000);     // ngắt sau 30s — history vẫn được persist
+for await (const m of q) { /* ... */ }      // kết thúc bằng result errors:["Interrupted by user"]
+// tiếp tục sau đó:
+query({ prompt: "làm tiếp đi", options: { ...options, resume: sessionId } });
+```
+
+- **CLI**: Ctrl+C lần 1 ngắt run hiện tại (session được lưu, in hướng dẫn resume); Ctrl+C lần 2 thoát. Resume bằng `--resume <id>` (hoặc `--session <id>`).
+- **Server**: xem bên dưới.
+
 ## Express API
 
 ```sh
@@ -171,19 +193,51 @@ npm run serve -- --port 3333
 
 curl -s http://127.0.0.1:3333/health
 curl -s http://127.0.0.1:3333/v1/tools
-curl -s http://127.0.0.1:3333/v1/sessions
+curl -s http://127.0.0.1:3333/v1/sessions          # sessions đã persist (resume targets)
+curl -s http://127.0.0.1:3333/v1/query/active      # query đang chạy
+
+# Run thường (chọn sessionId trước để có thể interrupt):
 curl -s -X POST http://127.0.0.1:3333/v1/query \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"List files","permissionMode":"plan"}'
+  -d '{"prompt":"List files","permissionMode":"plan","sessionId":"my-run-1"}'
+
+# Interrupt từ request khác:
+curl -s -X POST http://127.0.0.1:3333/v1/query/my-run-1/interrupt
+
+# Resume hội thoại cũ:
+curl -s -X POST http://127.0.0.1:3333/v1/query \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"tiếp tục","resume":"my-run-1"}'
+
+# Streaming SSE (mỗi SDKMessage là một data: event; init chứa session_id):
+curl -N -X POST http://127.0.0.1:3333/v1/query \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"List files","stream":true}'
 ```
 
-`/v1/query` chạy `query()` và trả `{ result, sessionId, messages }`. Server mặc định `plan`
-(read-only) vì không có TTY để xác nhận permission.
+`/v1/query` trả `{ result, sessionId, interrupted, messages }` (hoặc SSE stream khi
+`stream:true`; client ngắt kết nối stream = interrupt). Server mặc định `plan` (read-only)
+vì không có TTY để xác nhận permission.
 
 ## Built-in tools (SDK names)
 
 `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `TodoWrite`, `WebFetch`, `WebSearch`, `Agent`
-(+ extras không thuộc SDK: `list_files`, `print_tree`, `TodoRead`).
+(+ extras không thuộc SDK: `CodebaseMap`, `TraceDeps`, `TraceCalls`, `Hypothesize`, `list_files`, `print_tree`, `TodoRead`, `Git`, `RunCode`, `BrowserSnapshot`).
+
+Orientation / điều tra (chạy TRƯỚC khi grep):
+
+- `CodebaseMap` — overview cấu trúc 1-lần-gọi: ngôn ngữ, manifest + dependencies, entry points, key files, layout top-level kèm số file. Đây là bước "scan structure" — orient top-down thay vì đoán mò.
+- `Hypothesize` — ghi 1-4 phỏng đoán root-cause **trước khi search**: mỗi cái gồm `cause` (nguyên nhân nghi ngờ), `predicts` (nếu đúng thì sẽ quan sát thấy gì), `check` (1 phép kiểm chứng). Biến điều tra thành hypothesis-driven thay vì grep mò.
+- `TraceDeps` — dependency ở mức module: mặc định liệt kê file import gì (internal vs external package); `reverse=true` liệt kê **ai phụ thuộc vào file này** → không vỡ caller khi sửa.
+- `TraceCalls` — **execution path** ở mức function: `callers` (mặc định) trace ai gọi hàm này → ai gọi hàm đó → … tới entry point (để hiểu lỗi được chạy tới bằng đường nào); `callees` liệt kê hàm này gọi gì. Call graph bằng regex (heuristic) — verify bằng cách đọc site được liệt kê.
+
+Điểm dừng cho search: agent không grep/read mãi được. Sau `maxSearchSteps` lần explore liên tiếp (mặc định 16, đổi bằng `--max-search-steps` / `OPENROUTER_MAX_SEARCH_STEPS`, đặt 0 để tắt) mà không edit/run/Hypothesize, loop tự chèn 1 system message ép agent hội tụ (ghi hypothesis → kiểm chứng cái khả dĩ nhất → hành động). `maxTurns` vẫn là trần cứng.
+
+Runtime/UI debug:
+
+- `Git` — inspect read-only (`status/diff/log/show/branch/remote/blame/stash list`) qua execFile, không shell, không bao giờ prompt (kể cả plan mode). Git mutations vẫn đi qua `Bash`.
+- `RunCode` — chạy script node/python độc lập trong **temp dir cách ly** + timeout, trả stdout/stderr/exit code. Dùng để reproduce bug, test regex/function. Được gate như Bash vì là thực thi code.
+- `BrowserSnapshot` — debug **UI web/snapshot**: mở URL bằng headless browser, trả console errors, page errors, failed requests (4xx/5xx), title, rendered text; lưu screenshot vào `.oragent/snapshots/`. Cần `npm i -D playwright && npx playwright install chromium` (hoặc `puppeteer`) — import lazy, không phải dependency cứng. Quy trình debug snapshot: chạy `BrowserSnapshot` lấy diagnostics dạng text → nếu cần "nhìn" ảnh, chạy lại với `--image .oragent/snapshots/<file>.png` để perception model đọc.
 
 - Mọi tool args được validate + coerce theo JSON schema trước khi chạy; sai schema trả về `INVALID INPUT …` để model tự sửa.
 - `Glob`/`Grep`/`list_files` tôn trọng `.gitignore` ở root và thư mục con; chỉ `.git/` luôn bị bỏ qua. `Grep` hỗ trợ `case_sensitive` + `context` lines.

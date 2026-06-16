@@ -10,6 +10,8 @@ import { filePlugins, resolveAttachments } from '../context/attachments.js';
 import { perceive } from '../context/perception.js';
 import { compact, estimateTokens, trimOldToolResults } from '../context/compaction.js';
 import { evaluate } from '../permissions/index.js';
+import { EXPLORATION_TOOLS } from '../tools/meta.js';
+import { searchBudgetNudge } from './search-budget.js';
 import { runHooks } from '../hooks/index.js';
 import { loadSession, newSessionId, saveSession } from '../sessions/index.js';
 import {
@@ -32,7 +34,20 @@ import {
 // the turn loop (model call -> assistant -> permission/hook-gated tool exec ->
 // tool_result), context compaction, session persistence, and the terminal
 // result message.
-export async function* query({ prompt, options = {} } = {}) {
+//
+// Like the SDK's Query object, the returned generator carries control methods:
+//   .interrupt()       abort the run; history so far is persisted, so the
+//                      session can be continued later via options.resume
+//   .abortController   the underlying controller (caller-supplied or created)
+export function query({ prompt, options = {} } = {}) {
+    const abortController = options.abortController || new AbortController();
+    const generator = runQuery({ prompt, options: { ...options, abortController } });
+    generator.interrupt = () => abortController.abort();
+    generator.abortController = abortController;
+    return generator;
+}
+
+async function* runQuery({ prompt, options = {} } = {}) {
     if (prompt === undefined || prompt === null) throw new Error('prompt is required');
 
     const opts = normalizeOptions(options);
@@ -167,11 +182,20 @@ export async function* query({ prompt, options = {} } = {}) {
     let numTurns = 0;
     const permissionDenials = [];
     const compactAtTokens = Math.floor(opts.maxContextTokens * 0.8);
+    // Convergence pressure: consecutive exploration calls since the last edit/
+    // run/hypothesis (see core/search-budget.js).
+    let searchStreak = 0;
+    let lastSearchWarnAt = 0;
 
     try {
         for (let turn = 1; turn <= opts.maxTurns; turn += 1) {
             if (signal?.aborted) {
-                yield finalResult('error_during_execution', { errors: ['Aborted'] });
+                // Persist before bailing so the interrupted session can be
+                // resumed with options.resume / --session.
+                await persist().catch(() => {});
+                yield finalResult('error_during_execution', {
+                    errors: ['Interrupted by user'],
+                });
                 return;
             }
             numTurns = turn;
@@ -270,7 +294,21 @@ export async function* query({ prompt, options = {} } = {}) {
                     name: call.function?.name,
                     content: result.content,
                 });
+                if (EXPLORATION_TOOLS.has(call.function?.name)) searchStreak += 1;
+                else {
+                    searchStreak = 0;
+                    lastSearchWarnAt = 0;
+                }
             }
+
+            // Apply stopping pressure once search runs on without converging.
+            const nudge = searchBudgetNudge(searchStreak, lastSearchWarnAt, opts.maxSearchSteps);
+            if (nudge) {
+                lastSearchWarnAt = nudge.warnAt;
+                messages.push({ role: 'system', content: nudge.message });
+                opts.onEvent({ type: 'search_budget', streak: searchStreak });
+            }
+
             yield userToolResult({ sessionId, results });
         }
 
@@ -281,7 +319,9 @@ export async function* query({ prompt, options = {} } = {}) {
         });
     } catch (error) {
         await persist().catch(() => {});
-        yield finalResult('error_during_execution', { errors: [error.message] });
+        yield finalResult('error_during_execution', {
+            errors: [signal?.aborted ? 'Interrupted by user' : error.message],
+        });
     }
 
     // --- turn helpers (closures over the loop state) ---

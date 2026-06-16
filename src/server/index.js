@@ -1,12 +1,33 @@
+import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { query } from '../core/query.js';
 import { OpenRouterClient } from '../providers/openrouter.js';
 import { toolDefinitions } from '../tools/index.js';
 import { listSessions } from '../sessions/index.js';
 
+// HTTP surface for the harness.
+//
+//   GET  /health
+//   GET  /v1/tools
+//   GET  /v1/models
+//   GET  /v1/sessions                    persisted sessions (resume targets)
+//   GET  /v1/query/active                sessionIds of currently running queries
+//   POST /v1/query                       run a query
+//        body: { prompt, sessionId?, resume?, stream?, ...options }
+//        - sessionId: client-chosen id so the run can be interrupted later
+//        - resume:    a previous sessionId to continue its conversation
+//        - stream:    true -> SSE; each SDKMessage as a `data:` event (the
+//          init event carries session_id, so streaming clients can interrupt
+//          without pre-choosing an id)
+//   POST /v1/query/:sessionId/interrupt  abort a running query; its history is
+//        persisted, so it can be continued with { resume: sessionId }
+
 export function createServer(defaults = {}) {
     const app = express();
     app.use(express.json({ limit: '2mb' }));
+
+    // sessionId -> generator (with .interrupt()) for in-flight queries.
+    const active = new Map();
 
     app.get('/health', (_req, res) => {
         res.json({ ok: true });
@@ -25,6 +46,20 @@ export function createServer(defaults = {}) {
         }
     });
 
+    app.get('/v1/query/active', (_req, res) => {
+        res.json({ active: [...active.keys()] });
+    });
+
+    app.post('/v1/query/:sessionId/interrupt', (req, res) => {
+        const generator = active.get(req.params.sessionId);
+        if (!generator) {
+            res.status(404).json({ error: `No active query with sessionId ${req.params.sessionId}` });
+            return;
+        }
+        generator.interrupt();
+        res.json({ ok: true, sessionId: req.params.sessionId, resumable: true });
+    });
+
     app.get('/v1/models', async (_req, res, next) => {
         try {
             const client = new OpenRouterClient(defaults);
@@ -35,8 +70,8 @@ export function createServer(defaults = {}) {
         }
     });
 
-    // Run query() and collect the SDK message stream. Defaults to read-only
-    // (plan) since the server has no TTY to confirm tool permissions.
+    // Run query(). Defaults to read-only (plan) since the server has no TTY
+    // to confirm tool permissions.
     app.post('/v1/query', async (req, res, next) => {
         try {
             const body = req.body || {};
@@ -48,30 +83,53 @@ export function createServer(defaults = {}) {
                 return;
             }
 
-            const { prompt, ...rest } = body;
+            const { prompt, stream, ...rest } = body;
+            const sessionId = body.sessionId || body.resume || randomUUID();
             const options = {
                 ...defaults,
                 ...rest,
+                sessionId,
                 permissionMode,
                 cwd: body.cwd || defaults.cwd || process.cwd(),
             };
 
-            const messages = [];
-            let result = '';
-            let sessionId;
-            for await (const message of query({ prompt, options })) {
-                messages.push(message);
-                if (message.type === 'result') {
-                    sessionId = message.session_id;
-                    result =
-                        message.subtype === 'success'
-                            ? message.result
-                            : (message.errors || []).join('\n');
-                } else if (message.type === 'system') {
-                    sessionId = message.session_id;
+            const generator = query({ prompt, options });
+            active.set(sessionId, generator);
+
+            try {
+                if (stream) {
+                    res.writeHead(200, {
+                        'content-type': 'text/event-stream',
+                        'cache-control': 'no-cache',
+                        connection: 'keep-alive',
+                    });
+                    // A streaming client going away should stop the run (the
+                    // session stays resumable).
+                    req.on('close', () => generator.interrupt());
+                    for await (const message of generator) {
+                        res.write(`data: ${JSON.stringify(message)}\n\n`);
+                    }
+                    res.end();
+                    return;
                 }
+
+                const messages = [];
+                let result = '';
+                let interrupted = false;
+                for await (const message of generator) {
+                    messages.push(message);
+                    if (message.type === 'result') {
+                        result =
+                            message.subtype === 'success'
+                                ? message.result
+                                : (message.errors || []).join('\n');
+                        interrupted = (message.errors || []).includes('Interrupted by user');
+                    }
+                }
+                res.json({ result, sessionId, interrupted, messages });
+            } finally {
+                active.delete(sessionId);
             }
-            res.json({ result, sessionId, messages });
         } catch (error) {
             next(error);
         }

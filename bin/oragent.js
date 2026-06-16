@@ -53,12 +53,27 @@ async function chat(options) {
 }
 
 // Drive query() and render the SDK message stream. Returns the session id.
+// Ctrl+C interrupts the current run (history is persisted, so it can be
+// resumed with --session/--resume); a second Ctrl+C exits.
 async function drive(prompt, sdkOptions) {
   const toolNames = new Map(); // tool_use_id -> name, for tool_result labels
   const streaming = Boolean(sdkOptions.includePartialMessages);
   let sessionId;
 
-  for await (const message of query({ prompt, options: sdkOptions })) {
+  const controller = new AbortController();
+  let interrupts = 0;
+  const onSigint = () => {
+    interrupts += 1;
+    if (interrupts > 1) process.exit(130);
+    console.error(
+      "\n[interrupt] stopping current run — history is saved, resume with --resume <session>. Ctrl+C again to exit.",
+    );
+    controller.abort();
+  };
+  process.on("SIGINT", onSigint);
+
+  try {
+  for await (const message of query({ prompt, options: { ...sdkOptions, abortController: controller } })) {
     if (message.type === "system" && message.subtype === "init") {
       sessionId = message.session_id;
       console.error(
@@ -99,6 +114,9 @@ async function drive(prompt, sdkOptions) {
           (message.permission_denials.length ? ` denials=${message.permission_denials.length}` : ""),
       );
     }
+  }
+  } finally {
+    process.removeListener("SIGINT", onSigint);
   }
   return sessionId;
 }
@@ -195,10 +213,11 @@ function buildOptions(options, rl) {
     allowOutsideCwd: Boolean(options.allowOutsideCwd),
     // Context management + harness context sections.
     maxContextTokens: numberOption(options.maxContextTokens || process.env.OPENROUTER_MAX_CONTEXT_TOKENS),
+    maxSearchSteps: numberOption(options.maxSearchSteps || process.env.OPENROUTER_MAX_SEARCH_STEPS),
     autoCompact: options.noAutoCompact ? false : undefined,
     loadProjectContext: options.noProjectContext ? false : undefined,
     memory: options.noMemory ? false : undefined,
-    resume: options.session,
+    resume: options.session || options.resume,
     canUseTool: createCanUseTool(rl),
     // External context attachments: images, PDFs, docs, audio, video.
     attachments: buildAttachments(options),
@@ -226,6 +245,8 @@ function logEngineEvent(event) {
     console.error(`[compact] done — context now ~${event.estimatedTokens} tokens`);
   } else if (event.type === "compaction_error") {
     console.error(`[compact] failed (${event.error}) — trimmed old tool output instead`);
+  } else if (event.type === "search_budget") {
+    console.error(`[search] ${event.streak} consecutive explore calls — nudging agent to converge`);
   } else if (event.subagent && event.type === "tool_start") {
     console.error(`  [subagent tool] ${event.name}`);
   }
@@ -379,7 +400,8 @@ Options (mapped to SDK query() Options):
   --api-key <key>                    OpenRouter API key
   --cwd <path>                       Workspace directory
   --add-dir <a,b>                    Extra readable/writable directories
-  --session <id>                     Resume a local .oragent session
+  --session <id> / --resume <id>     Resume a local .oragent session
+                                     (Ctrl+C interrupts a run; it stays resumable)
   --max-turns <n>                    Agent loop limit, default 100
   --permission-mode <mode>           default | acceptEdits | bypassPermissions | plan
                                      (aliases: accept-edits, bypass, read-only)
@@ -405,6 +427,7 @@ Options (mapped to SDK query() Options):
   --no-web-search                    Disable OpenRouter server web search
   --no-web-fetch                     Disable OpenRouter server web fetch
   --max-context-tokens <n>           Estimated context budget before auto-compaction (default 100000)
+  --max-search-steps <n>             Consecutive search/read calls before a convergence nudge (default 16, 0=off)
   --no-auto-compact                  Disable context auto-compaction
   --no-project-context               Skip loading ORAGENT.md / AGENTS.md / CLAUDE.md
   --no-memory                        Skip loading the persistent memory index
